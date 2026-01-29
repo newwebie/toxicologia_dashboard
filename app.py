@@ -340,7 +340,7 @@ def get_all_results(start_date: datetime = None, end_date: datetime = None):
                 results_dict[lot_code].append({
                     "_sample": sample.get('_sample'),
                     "positive": sample.get('positive', False),
-                    "compounds": sample.get('compounds', [])
+                    "compounds": sample.get('_compound', []) or sample.get('compounds', [])
                 })
 
         return results_dict
@@ -616,6 +616,27 @@ def get_cities_by_state(state: str = None) -> list:
     return sorted(list(cities))
 
 
+@st.cache_data(ttl=3600)
+def get_laboratories_by_cnpj() -> dict:
+    """
+    Retorna dicionário de laboratórios indexado por CNPJ.
+    Formato: {cnpj: {id, name, city, state}}
+    Laboratórios sem CNPJ são ignorados.
+    """
+    labs = get_laboratories_with_address()
+    labs_by_cnpj = {}
+    for lab in labs:
+        cnpj = lab.get('cnpj', '').strip()
+        if cnpj:
+            labs_by_cnpj[cnpj] = {
+                "id": lab.get('id'),
+                "name": lab.get('name', 'Desconhecido'),
+                "city": lab.get('city', ''),
+                "state": lab.get('state', '')
+            }
+    return labs_by_cnpj
+
+
 # Mapeamento de finalidades (purpose.type no banco -> nome exibido)
 PURPOSE_MAP = {
     "clt": "CLT",
@@ -881,18 +902,10 @@ def main():
         for pag in paginas:
             tipo_botao = "primary" if st.session_state.pagina_atual == pag else "secondary"
             if st.button(pag, key=f"nav_{pag}", use_container_width=True, type=tipo_botao):
-                st.session_state.pagina_anterior = st.session_state.pagina_atual
                 st.session_state.pagina_atual = pag
-                st.session_state.carregando_pagina = True
                 st.rerun()
 
         pagina = st.session_state.pagina_atual
-
-        # Inicializar variáveis de controle de carregamento
-        if 'carregando_pagina' not in st.session_state:
-            st.session_state.carregando_pagina = False
-        if 'pagina_anterior' not in st.session_state:
-            st.session_state.pagina_anterior = None
 
         st.markdown("---")
 
@@ -974,78 +987,21 @@ def main():
                 st.session_state.base_data_loaded = False
                 st.rerun()
 
-    # Roteamento com tela de carregamento
-    if st.session_state.get('carregando_pagina', False):
-        # Mostrar card de carregamento
-        st.markdown("""
-            <style>
-                @keyframes pulse {
-                    0% { opacity: 1; }
-                    50% { opacity: 0.5; }
-                    100% { opacity: 1; }
-                }
-                .loading-spinner {
-                    animation: pulse 1.5s ease-in-out infinite;
-                }
-            </style>
-            <div style="
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                height: 70vh;
-            ">
-                <div style="
-                    background: white;
-                    border-radius: 16px;
-                    padding: 50px 80px;
-                    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
-                    text-align: center;
-                    border: 1px solid #e0e0e0;
-                ">
-                    <div class="loading-spinner" style="font-size: 60px; margin-bottom: 25px;">
-                        🔄
-                    </div>
-                    <h2 style="
-                        color: #1A1A2E;
-                        margin: 0 0 15px 0;
-                        font-size: 24px;
-                        font-weight: 600;
-                    ">
-                        Carregando dados...
-                    </h2>
-                    <p style="
-                        color: #666;
-                        margin: 0;
-                        font-size: 16px;
-                        line-height: 1.5;
-                    ">
-                        Isso pode levar alguns minutos.<br>
-                        Por favor, aguarde.
-                    </p>
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
-
-        # Resetar flag de carregamento após renderizar
-        st.session_state.carregando_pagina = False
-        st.rerun()
-    else:
-        # Renderizar página normalmente
-        if pagina == "🏠 Visão Geral":
-            render_visao_geral()
-        elif pagina == "🧪 Substâncias":
-            render_substancias()
-        elif pagina == "🗺️ Mapa Geográfico":
-            render_mapa()
-        elif pagina == "📈 Análise Temporal":
-            render_temporal()
-        elif pagina == "📋 Tabela Detalhada":
-            render_tabela_detalhada()
-        elif pagina == "🔍 Auditoria":
-            render_auditoria()
-        elif pagina == "🏢 Rede":
-            render_rede()
+    # Roteamento de páginas
+    if pagina == "🏠 Visão Geral":
+        render_visao_geral()
+    elif pagina == "🧪 Substâncias":
+        render_substancias()
+    elif pagina == "🗺️ Mapa Geográfico":
+        render_mapa()
+    elif pagina == "📈 Análise Temporal":
+        render_temporal()
+    elif pagina == "📋 Tabela Detalhada":
+        render_tabela_detalhada()
+    elif pagina == "🔍 Auditoria":
+        render_auditoria()
+    elif pagina == "🏢 Rede":
+        render_rede()
 
 
 # ============================================
@@ -1161,8 +1117,8 @@ def render_tabela_substancias():
 def get_substance_data() -> pd.DataFrame:
     """
     Busca dados de substâncias - amostras do período selecionado
+    Usa aggregation pipeline do MongoDB para fazer $lookup e unwind
     Retorna uma linha por amostra, com uma coluna para cada substância
-    Usa cache de sessão para evitar recarregamentos.
     """
     # Obter período selecionado
     start_date, end_date = get_selected_period()
@@ -1174,20 +1130,20 @@ def get_substance_data() -> pd.DataFrame:
         return cached
 
     try:
-        # 1. Buscar lotes do período (incluindo tipo de análise)
+        # 1. Buscar lotes do período para criar mapeamento de tipo de análise
         lots_collection = get_collection("lots")
-
         lots_period = list(lots_collection.find(
             {"createdAt": {"$gte": start_date, "$lte": end_date}},
-            {"code": 1, "analysisType": 1}
+            {"code": 1, "analysisType": 1, "createdAt": 1}
         ))
 
         if not lots_period:
             return pd.DataFrame()
 
-        # 2. Extrair códigos dos lotes e criar mapeamento para tipo de análise
+        # Criar mapeamentos de lote
         lot_codes = []
         lot_type_map = {}
+        lot_date_map = {}
         analysis_type_names = {
             "screening": "Triagem",
             "confirmatory": "Confirmatório",
@@ -1200,104 +1156,103 @@ def get_substance_data() -> pd.DataFrame:
                 lot_codes.append(code)
                 analysis_type = lot.get('analysisType', '')
                 lot_type_map[code] = analysis_type_names.get(analysis_type, analysis_type or 'N/A')
-
-        # 3. Buscar mapeamento de compounds do banco (fazer antes para usar no processamento)
-        compounds_map = get_compounds_map()
-
-        # 4. Função para processar um lote de results
-        def process_substance_batch(batch_lot_codes):
-            try:
-                client = get_mongo_client()
-                db = client["ctox"]
-                results_collection = db["results"]
-
-                results = list(results_collection.find(
-                    {"_lot": {"$in": batch_lot_codes}},
-                    {"_lot": 1, "samples": 1, "createdAt": 1}
-                ))
-
-                batch_rows = []
-                for result in results:
-                    lot_code = result.get('_lot', 'N/A')
-                    created_at = result.get('createdAt')
-
+                created_at = lot.get('createdAt')
+                if created_at:
                     # Converter UTC para UTC-3 (horário de Brasília)
-                    if created_at:
-                        created_at_brt = created_at - timedelta(hours=3)
-                        data_str = created_at_brt.strftime('%d/%m/%Y')
-                    else:
-                        data_str = 'N/A'
+                    created_at_brt = created_at - timedelta(hours=3)
+                    lot_date_map[code] = created_at_brt.strftime('%d/%m/%Y')
+                else:
+                    lot_date_map[code] = 'N/A'
 
-                    # Obter tipo de lote
-                    tipo_lote = lot_type_map.get(lot_code, 'N/A')
+        # 2. Aggregation pipeline no MongoDB
+        client = get_mongo_client()
+        db = client["ctox"]
+        results_collection = db["results"]
 
-                    for sample in result.get('samples', []):
-                        sample_code = sample.get('_sample', 'N/A')
+        pipeline = [
+            # Filtrar pelos lotes do período
+            {"$match": {"_lot": {"$in": lot_codes}}},
 
-                        # Criar linha base
-                        row = {
-                            'Data': data_str,
-                            'Lote': lot_code,
-                            'Tipo de Lote': tipo_lote,
-                            'Amostra': sample_code
-                        }
+            # Desaninhar as amostras - cada sample vira um documento separado
+            {"$unwind": "$samples"},
 
-                        # Inicializar todas as substâncias como Negativo
-                        for substance_name in compounds_map.values():
-                            row[substance_name] = 'Negativo'
+            # Desaninhar os compounds de cada amostra
+            {"$unwind": "$samples._compound"},
 
-                        # Preencher resultados das substâncias
-                        for compound in sample.get('compounds', []):
-                            compound_id = compound.get('_compound')
-                            is_positive = compound.get('positive', False)
+            # Lookup para pegar o nome do compound da collection compounds
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "samples._compound._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
 
-                            # Converter ObjectId para string
-                            if isinstance(compound_id, ObjectId):
-                                compound_id_str = str(compound_id)
-                            else:
-                                compound_id_str = str(compound_id) if compound_id else None
+            # Pegar só o primeiro resultado do lookup
+            {"$unwind": "$compoundInfo"},
 
-                            # Nome da substância (busca no mapeamento do banco)
-                            substance_name = compounds_map.get(compound_id_str)
-                            if substance_name:
-                                row[substance_name] = 'Positivo' if is_positive else 'Negativo'
+            # Projetar os campos que interessam
+            {
+                "$project": {
+                    "_lot": 1,
+                    "_sample": "$samples._sample",
+                    "samplePositive": "$samples.positive",
+                    "compoundName": "$compoundInfo.name",
+                    "compoundPositive": "$samples._compound.positive",
+                    "concentration": "$samples._compound.concentration"
+                }
+            }
+        ]
 
-                        batch_rows.append(row)
+        # Executar aggregation
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
 
-                return batch_rows
-            except Exception as e:
-                return []
-
-        # 5. Dividir em lotes para processamento paralelo
-        batch_size = 500
-        batches = [lot_codes[i:i + batch_size] for i in range(0, len(lot_codes), batch_size)]
-
-        all_rows = []
-
-        # Processar lotes em paralelo
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_batch = {executor.submit(process_substance_batch, batch): batch for batch in batches}
-
-            for future in as_completed(future_to_batch):
-                try:
-                    batch_rows = future.result()
-                    if batch_rows:
-                        all_rows.extend(batch_rows)
-                except Exception as e:
-                    pass
-
-        if not all_rows:
+        if not results:
             return pd.DataFrame()
 
-        df = pd.DataFrame(all_rows)
+        # 3. Converter para DataFrame no formato "long"
+        df_long = pd.DataFrame(results)
+
+        # 4. Pivotar para ter cada compound como coluna
+        # Primeiro, criar tabela base com metadados únicos por amostra
+        df_meta = df_long[['_lot', '_sample', 'samplePositive']].drop_duplicates()
+
+        # Pivotar os compounds
+        df_pivot = df_long.pivot_table(
+            index='_sample',
+            columns='compoundName',
+            values='compoundPositive',
+            aggfunc='first'  # Caso haja duplicatas, pegar o primeiro
+        ).reset_index()
+
+        # Converter True/False para "Positivo"/"Negativo"
+        compound_cols = [col for col in df_pivot.columns if col != '_sample']
+        for col in compound_cols:
+            df_pivot[col] = df_pivot[col].apply(lambda x: 'Positivo' if x == True else 'Negativo')
+
+        # 5. Juntar metadados com dados pivotados
+        df_final = df_meta.merge(df_pivot, on='_sample', how='left')
+
+        # 6. Adicionar colunas de Data e Tipo de Lote
+        df_final['Data'] = df_final['_lot'].map(lot_date_map).fillna('N/A')
+        df_final['Tipo de Lote'] = df_final['_lot'].map(lot_type_map).fillna('N/A')
+
+        # 7. Renomear e reorganizar colunas
+        df_final = df_final.rename(columns={'_lot': 'Lote', '_sample': 'Amostra'})
+
+        # Reordenar: Data, Lote, Tipo de Lote, Amostra, depois as substâncias
+        first_cols = ['Data', 'Lote', 'Tipo de Lote', 'Amostra']
+        other_cols = [col for col in df_final.columns if col not in first_cols and col != 'samplePositive']
+        df_final = df_final[first_cols + sorted(other_cols)]
 
         # Salvar no cache de sessão
-        set_cached_data("substance_data", cache_key, df)
+        set_cached_data("substance_data", cache_key, df_final)
 
-        return df
+        return df_final
 
     except Exception as e:
-        st.error(f"Erro: {e}")
+        st.error(f"Erro ao buscar dados de substâncias: {e}")
         return pd.DataFrame()
 
 
@@ -1601,18 +1556,33 @@ def render_visao_geral():
         )
         selected_purpose = finalidades[selected_finalidade_name]
 
-    # Filtro de Laboratório
+    # Filtro de Laboratório por CNPJ
     with col_filtro3:
-        laboratories_map = get_laboratories_map()
-        lab_options = {"Todos": None}
-        lab_options.update({name: lab_id for lab_id, name in laboratories_map.items()})
+        labs_by_cnpj = get_laboratories_by_cnpj()
+        cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
 
-        selected_lab_name = st.selectbox(
-            "Laboratório (PCL)",
-            options=list(lab_options.keys()),
+        selected_cnpj = st.selectbox(
+            "CNPJ Laboratório (PCL)",
+            options=cnpj_options,
             index=0
         )
-        selected_lab_id = lab_options[selected_lab_name]
+
+        if selected_cnpj and selected_cnpj != "Todos":
+            lab_info = labs_by_cnpj.get(selected_cnpj, {})
+            selected_lab_id = lab_info.get("id")
+            selected_lab_name = lab_info.get("name", "")
+            selected_lab_city = lab_info.get("city", "")
+            selected_lab_state = lab_info.get("state", "")
+        else:
+            selected_lab_id = None
+            selected_lab_name = None
+            selected_lab_city = None
+            selected_lab_state = None
+
+    # Exibir informações do laboratório selecionado
+    if selected_lab_name:
+        location_info = f"{selected_lab_city}/{selected_lab_state}" if selected_lab_city and selected_lab_state else ""
+        st.success(f"🏢 **{selected_lab_name}** {f'({location_info})' if location_info else ''}")
 
     st.markdown("---")
 
@@ -2775,26 +2745,28 @@ def render_taxa_positividade():
     col_f1, col_f2 = st.columns([2, 1])
 
     with col_f1:
-        # Buscar laboratórios com CNPJ
-        labs = get_laboratories_with_address()
-        lab_options = {}
-        for lab in labs:
-            cnpj = lab.get('cnpj', '')
-            name = lab.get('name', 'Desconhecido')
-            if cnpj:
-                label = f"{name} ({cnpj})"
-            else:
-                label = name
-            lab_options[label] = lab['id']
+        # Buscar laboratórios por CNPJ
+        labs_by_cnpj = get_laboratories_by_cnpj()
+        cnpj_options = sorted(labs_by_cnpj.keys())
 
-        selected_labs = st.multiselect(
+        selected_cnpjs = st.multiselect(
             "CNPJ Laboratório (seleção múltipla)",
-            options=list(lab_options.keys()),
+            options=cnpj_options,
             default=[],
             key="taxa_labs_multi",
-            placeholder="Selecione um ou mais laboratórios..."
+            placeholder="Selecione um ou mais CNPJs..."
         )
-        lab_ids_filter = [lab_options[lab] for lab in selected_labs] if selected_labs else None
+
+        # Obter IDs e informações dos laboratórios selecionados
+        lab_ids_filter = []
+        selected_labs_info = []
+        for cnpj in selected_cnpjs:
+            lab_info = labs_by_cnpj.get(cnpj, {})
+            if lab_info.get("id"):
+                lab_ids_filter.append(lab_info["id"])
+                selected_labs_info.append(lab_info)
+
+        lab_ids_filter = lab_ids_filter if lab_ids_filter else None
 
     with col_f2:
         # Mostrar período selecionado (vem do filtro global na sidebar)
@@ -2877,6 +2849,16 @@ def render_taxa_positividade():
         )
         city_filter = selected_city if selected_city != "Todas" else None
 
+    # Exibir informações dos laboratórios selecionados
+    if selected_labs_info:
+        labs_display = []
+        for lab in selected_labs_info:
+            name = lab.get("name", "")
+            city = lab.get("city", "")
+            state = lab.get("state", "")
+            location = f"{city}/{state}" if city and state else ""
+            labs_display.append(f"**{name}** {f'({location})' if location else ''}")
+        st.success(f"🏢 Laboratórios selecionados: {', '.join(labs_display)}")
 
     # Usar período do filtro global
     start_date_filter, end_date_filter = get_selected_period()
@@ -3439,16 +3421,27 @@ def render_substancias():
     col_f1, col_f2, col_f3 = st.columns(3)
 
     with col_f1:
-        laboratories_map = get_laboratories_map()
-        lab_options = {"Todos": None}
-        lab_options.update({name: lab_id for lab_id, name in laboratories_map.items()})
-        selected_lab_name = st.selectbox(
-            "Laboratório",
-            options=list(lab_options.keys()),
+        labs_by_cnpj = get_laboratories_by_cnpj()
+        cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
+
+        selected_cnpj = st.selectbox(
+            "CNPJ Laboratório",
+            options=cnpj_options,
             index=0,
             key="subst_lab"
         )
-        selected_lab_id = lab_options[selected_lab_name]
+
+        if selected_cnpj and selected_cnpj != "Todos":
+            lab_info = labs_by_cnpj.get(selected_cnpj, {})
+            selected_lab_id = lab_info.get("id")
+            selected_lab_name = lab_info.get("name", "")
+            selected_lab_city = lab_info.get("city", "")
+            selected_lab_state = lab_info.get("state", "")
+        else:
+            selected_lab_id = None
+            selected_lab_name = None
+            selected_lab_city = None
+            selected_lab_state = None
 
     with col_f2:
         meses = {
@@ -3473,6 +3466,11 @@ def render_substancias():
             key="subst_analysis"
         )
         selected_analysis = analysis_options[selected_analysis_name]
+
+    # Exibir informações do laboratório selecionado
+    if selected_lab_name:
+        location_info = f"{selected_lab_city}/{selected_lab_state}" if selected_lab_city and selected_lab_state else ""
+        st.success(f"🏢 **{selected_lab_name}** {f'({location_info})' if location_info else ''}")
 
     st.markdown("---")
 
@@ -3659,7 +3657,9 @@ def get_substance_statistics(laboratory_id: str = None, month: int = None, analy
     Busca estatísticas de positividade por substância.
     Retorna dict {substância: {total, positivos, negativos, taxa}}
     """
-    cache_key = generate_cache_key("substance_stats", laboratory_id, month, analysis_type)
+    # Usar período selecionado na sidebar para cache key
+    selected_start, selected_end = get_selected_period()
+    cache_key = generate_cache_key("substance_stats", laboratory_id, month, analysis_type, selected_start.isoformat(), selected_end.isoformat())
     cached = get_cached_data("substance_stats", cache_key)
     if cached is not None:
         return cached
@@ -3668,7 +3668,7 @@ def get_substance_statistics(laboratory_id: str = None, month: int = None, analy
         lots_collection = get_collection("lots")
         results_collection = get_collection("results")
 
-        # Período (usar últimos 30 dias por padrão)
+        # Período - usar período selecionado na sidebar
         if month:
             # Se mês específico foi passado, usar o ano atual
             year = datetime.now().year
@@ -3678,8 +3678,8 @@ def get_substance_statistics(laboratory_id: str = None, month: int = None, analy
             else:
                 end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
         else:
-            start_date = DEFAULT_START_DATE
-            end_date = DEFAULT_END_DATE
+            start_date = selected_start
+            end_date = selected_end
 
         # Tipos de análise
         if analysis_type == "all":
@@ -3737,9 +3737,17 @@ def get_substance_statistics(laboratory_id: str = None, month: int = None, analy
                 if allowed_sample_codes is not None and sample_code not in allowed_sample_codes:
                     continue
 
-                compounds = sample.get('compounds', [])
+                # O array de compounds está em '_compound'
+                compounds = sample.get('_compound', []) or sample.get('compounds', [])
                 for compound in compounds:
-                    compound_id = str(compound.get('_compound', ''))
+                    # O ID do compound está em '_id' (ObjectId do MongoDB)
+                    compound_id_raw = compound.get('_id')
+                    if isinstance(compound_id_raw, ObjectId):
+                        compound_id = str(compound_id_raw)
+                    elif isinstance(compound_id_raw, dict) and '$oid' in compound_id_raw:
+                        compound_id = compound_id_raw['$oid']
+                    else:
+                        compound_id = str(compound_id_raw) if compound_id_raw else ''
                     is_positive = compound.get('positive', False)
 
                     # Nome da substância
@@ -3926,7 +3934,9 @@ def get_geographic_data(month: int = None, analysis_type: str = "all") -> dict:
     """
     Busca dados geográficos por estado e cidade.
     """
-    cache_key = generate_cache_key("geographic", month, analysis_type)
+    # Usar período selecionado na sidebar para cache key
+    selected_start, selected_end = get_selected_period()
+    cache_key = generate_cache_key("geographic", month, analysis_type, selected_start.isoformat(), selected_end.isoformat())
     cached = get_cached_data("geographic_data", cache_key)
     if cached is not None:
         return cached
@@ -3943,7 +3953,7 @@ def get_geographic_data(month: int = None, analysis_type: str = "all") -> dict:
                 "cidade": lab.get('city', 'Não informada') or 'Não informada'
             }
 
-        # Período (usar últimos 30 dias por padrão)
+        # Período - usar período selecionado na sidebar
         if month:
             # Se mês específico foi passado, usar o ano atual
             year = datetime.now().year
@@ -3953,8 +3963,8 @@ def get_geographic_data(month: int = None, analysis_type: str = "all") -> dict:
             else:
                 end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
         else:
-            start_date = DEFAULT_START_DATE
-            end_date = DEFAULT_END_DATE
+            start_date = selected_start
+            end_date = selected_end
 
         # Tipos de análise
         if analysis_type == "all":
@@ -4076,11 +4086,27 @@ def render_temporal():
     col_f1, col_f2, col_f3 = st.columns(3)
 
     with col_f1:
-        laboratories_map = get_laboratories_map()
-        lab_options = {"Todos": None}
-        lab_options.update({name: lab_id for lab_id, name in laboratories_map.items()})
-        selected_lab_name = st.selectbox("Laboratório", options=list(lab_options.keys()), index=0, key="temp_lab")
-        selected_lab_id = [lab_options[selected_lab_name]] if lab_options[selected_lab_name] else None
+        labs_by_cnpj = get_laboratories_by_cnpj()
+        cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
+
+        selected_cnpj = st.selectbox(
+            "CNPJ Laboratório",
+            options=cnpj_options,
+            index=0,
+            key="temp_lab"
+        )
+
+        if selected_cnpj and selected_cnpj != "Todos":
+            lab_info = labs_by_cnpj.get(selected_cnpj, {})
+            selected_lab_id = [lab_info.get("id")] if lab_info.get("id") else None
+            selected_lab_name = lab_info.get("name", "")
+            selected_lab_city = lab_info.get("city", "")
+            selected_lab_state = lab_info.get("state", "")
+        else:
+            selected_lab_id = None
+            selected_lab_name = None
+            selected_lab_city = None
+            selected_lab_state = None
 
     with col_f2:
         analysis_options = {"Triagem": "screening", "Confirmatório": "confirmatory", "Todos": "all"}
@@ -4091,6 +4117,11 @@ def render_temporal():
         view_options = {"Mensal": "monthly", "Semanal": "weekly"}
         selected_view = st.selectbox("Visualização", options=list(view_options.keys()), index=0, key="temp_view")
         view_type = view_options[selected_view]
+
+    # Exibir informações do laboratório selecionado
+    if selected_lab_name:
+        location_info = f"{selected_lab_city}/{selected_lab_state}" if selected_lab_city and selected_lab_state else ""
+        st.success(f"🏢 **{selected_lab_name}** {f'({location_info})' if location_info else ''}")
 
     st.markdown("---")
 
@@ -4247,7 +4278,9 @@ def get_weekly_data(laboratory_ids: list = None, analysis_type: str = "screening
     """
     Busca dados semanais de positividade.
     """
-    cache_key = generate_cache_key("weekly_data", laboratory_ids, analysis_type)
+    # Usar período selecionado na sidebar
+    selected_start, selected_end = get_selected_period()
+    cache_key = generate_cache_key("weekly_data", laboratory_ids, analysis_type, selected_start.isoformat(), selected_end.isoformat())
     cached = get_cached_data("weekly_data", cache_key)
     if cached is not None:
         return cached
@@ -4256,9 +4289,9 @@ def get_weekly_data(laboratory_ids: list = None, analysis_type: str = "screening
         lots_collection = get_collection("lots")
         results_collection = get_collection("results")
 
-        # Usar período padrão (últimos 30 dias)
-        start_date = DEFAULT_START_DATE
-        end_date = DEFAULT_END_DATE
+        # Usar período selecionado na sidebar
+        start_date = selected_start
+        end_date = selected_end
 
         # Tipos de análise
         if analysis_type == "all":
