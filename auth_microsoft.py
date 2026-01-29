@@ -248,7 +248,7 @@ class MicrosoftAuth:
             self.client_secret = auth_config.get("client_secret", os.getenv("AZURE_CLIENT_SECRET"))
             self.tenant_id = auth_config.get("tenant_id", os.getenv("AZURE_TENANT_ID"))
             self.redirect_uri_local = auth_config.get("redirect_uri_local", "http://localhost:8501")
-            self.redirect_uri_prod = auth_config.get("redirect_uri_prod", "https://toxicologia-dashboard.streamlit.app")
+            self.redirect_uri_prod = auth_config.get("redirect_uri_prod", "https://dashpositividade.streamlit.app/")
             self.authority = auth_config.get("authority", f"https://login.microsoftonline.com/{self.tenant_id}")
             self.scope = auth_config.get("scope", ["https://graph.microsoft.com/User.Read"])
 
