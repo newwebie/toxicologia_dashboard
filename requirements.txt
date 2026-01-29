@@ -1,0 +1,32 @@
+# Dashboard Toxicologia - Synvia
+# Dependências do projeto
+
+# Framework web
+streamlit>=1.28.0
+
+# Autenticação Microsoft
+msal>=1.24.0
+requests>=2.31.0
+
+# Banco de dados
+pymongo>=4.5.0
+
+# Processamento de dados
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualização
+plotly>=5.18.0
+altair>=5.0.0
+
+# Mapas
+folium>=0.14.0
+streamlit-folium>=0.15.0
+
+# Exportação
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+
+# Utilitários
+python-dateutil>=2.8.0
+pytz>=2023.3
