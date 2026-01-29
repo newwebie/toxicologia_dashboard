@@ -14,6 +14,7 @@ from bson import ObjectId
 import hashlib
 import json
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Aumentar limite do Pandas Styler para tabelas grandes
@@ -144,6 +145,86 @@ def clear_cache(cache_name: str = None):
         st.session_state.data_cache = {}
 
 
+def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
+    """
+    Executa uma lista de tarefas mostrando progress bar.
+
+    Args:
+        tasks: lista de tuplas [(nome, funcao, args, kwargs), ...]
+               ou [(nome, funcao), ...] para funções sem argumentos
+        message: mensagem exibida durante o carregamento
+
+    Returns:
+        dict com {nome: resultado}
+    """
+    results = {}
+    total = len(tasks)
+
+    progress_bar = st.progress(0, text=message)
+
+    for i, task in enumerate(tasks):
+        if len(task) == 2:
+            name, func = task
+            args, kwargs = (), {}
+        elif len(task) == 3:
+            name, func, args = task
+            kwargs = {}
+        else:
+            name, func, args, kwargs = task
+
+        # Atualizar progress bar
+        progress = (i) / total
+        progress_bar.progress(progress, text=f"{message} ({name})")
+
+        try:
+            if args and kwargs:
+                results[name] = func(*args, **kwargs)
+            elif args:
+                results[name] = func(*args)
+            elif kwargs:
+                results[name] = func(**kwargs)
+            else:
+                results[name] = func()
+        except Exception as e:
+            results[name] = None
+            st.error(f"Erro ao carregar {name}: {e}")
+
+    # Completar progress bar
+    progress_bar.progress(1.0, text="Concluído!")
+    time.sleep(0.3)  # Pequeno delay para mostrar "Concluído!"
+    progress_bar.empty()  # Remove a barra
+
+    return results
+
+
+def loading_single(func, message: str = "Carregando...", *args, **kwargs):
+    """
+    Executa uma única função mostrando progress bar simples.
+
+    Args:
+        func: função a executar
+        message: mensagem exibida durante o carregamento
+        *args, **kwargs: argumentos para a função
+
+    Returns:
+        resultado da função
+    """
+    progress_bar = st.progress(0, text=message)
+
+    # Simular progresso inicial
+    progress_bar.progress(0.3, text=message)
+
+    try:
+        result = func(*args, **kwargs)
+        progress_bar.progress(1.0, text="Concluído!")
+        time.sleep(0.2)
+        progress_bar.empty()
+        return result
+    except Exception as e:
+        progress_bar.empty()
+        raise e
+
+
 def run_parallel_tasks(tasks: dict, max_workers: int = 5) -> dict:
     """
     Executa múltiplas funções em paralelo usando ThreadPoolExecutor.
@@ -190,8 +271,8 @@ def load_base_data():
     """
     Carrega dados básicos que são usados em múltiplas páginas.
     Chamado uma vez no início da sessão.
-    Usa processamento paralelo para carregar mais rápido.
-    Pré-carrega TODOS os dados do período padrão (últimos 30 dias) para acelerar consultas subsequentes.
+    Mostra progress bar durante o carregamento.
+    Pré-carrega TODOS os dados do período padrão para acelerar consultas subsequentes.
     """
     init_session_cache()
 
@@ -201,9 +282,8 @@ def load_base_data():
     # Garantir índices (só executa se necessário)
     ensure_indexes()
 
-    # Pré-carregar TODOS os dados em paralelo (popula o cache do Streamlit)
-    with st.spinner("Carregando dados... (primeira execução pode demorar)"):
-        preload_all_data()
+    # Pré-carregar dados com progress bar
+    preload_all_data()
 
     st.session_state.base_data_loaded = True
 
@@ -449,40 +529,26 @@ def get_renach_data_cached(start_date: datetime = None, end_date: datetime = Non
 
 def preload_all_data():
     """
-    Pré-carrega todos os dados necessários em paralelo.
+    Pré-carrega todos os dados necessários com progress bar.
     Chamado uma vez no início para popular o cache.
     Usa o período selecionado pelo usuário.
     """
     # Obter período selecionado
     start_date, end_date = get_selected_period()
 
-    # Funções com período
-    def load_lots():
-        return get_all_lots(start_date, end_date)
+    # Lista de tarefas para o progress bar
+    tasks = [
+        ("Lotes", get_all_lots, (start_date, end_date)),
+        ("Resultados", get_all_results, (start_date, end_date)),
+        ("Coletas", get_all_gatherings, (start_date, end_date)),
+        ("Mapeamento de amostras", get_chain_to_sample_map, (start_date, end_date)),
+        ("Dados RENACH", get_renach_data_cached, (start_date, end_date)),
+        ("Substâncias", get_compounds_map),
+        ("Laboratórios", get_laboratories_map),
+        ("Endereços", get_laboratories_with_address),
+    ]
 
-    def load_results():
-        return get_all_results(start_date, end_date)
-
-    def load_gatherings():
-        return get_all_gatherings(start_date, end_date)
-
-    def load_chain_map():
-        return get_chain_to_sample_map(start_date, end_date)
-
-    def load_renach():
-        return get_renach_data_cached(start_date, end_date)
-
-    tasks = {
-        "lots": load_lots,
-        "results": load_results,
-        "gatherings": load_gatherings,
-        "chain_map": load_chain_map,
-        "renach": load_renach,
-        "compounds": get_compounds_map,
-        "labs_map": get_laboratories_map,
-        "labs_address": get_laboratories_with_address,
-    }
-    return run_parallel_tasks(tasks, max_workers=8)
+    return loading_with_progress(tasks, "Carregando dados iniciais...")
 
 
 # ============================================
@@ -891,6 +957,7 @@ def main():
 
         paginas = [
             "🏠 Visão Geral",
+            "👤 Perfil Demográfico",
             "🧪 Substâncias",
             "🗺️ Mapa Geográfico",
             "📈 Análise Temporal",
@@ -990,6 +1057,8 @@ def main():
     # Roteamento de páginas
     if pagina == "🏠 Visão Geral":
         render_visao_geral()
+    elif pagina == "👤 Perfil Demográfico":
+        render_perfil_demografico()
     elif pagina == "🧪 Substâncias":
         render_substancias()
     elif pagina == "🗺️ Mapa Geográfico":
@@ -1013,9 +1082,7 @@ def render_tabela_substancias():
     Tabela de Substâncias - Amostras do período selecionado
     """
 
-
-    with st.spinner("Carregando dados..."):
-        df = get_substance_data()
+    df = loading_single(get_substance_data, "Carregando tabela de substâncias...")
 
     if df.empty:
         st.warning("⚠️ Nenhum dado encontrado")
@@ -1505,8 +1572,7 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
 
 
 def render_visao_geral():
-    # Placeholder para título (será preenchido após carregar dados)
-    titulo_placeholder = st.empty()
+    st.title("🏠 Visão Geral")
 
     # Mostrar período selecionado
     periodo_inicio, periodo_fim = get_selected_period()
@@ -1556,6 +1622,321 @@ def render_visao_geral():
         )
         selected_purpose = finalidades[selected_finalidade_name]
 
+    # Filtro de Laboratório por CNPJ - MÚLTIPLA SELEÇÃO
+    with col_filtro3:
+        labs_by_cnpj = get_laboratories_by_cnpj()
+        cnpj_options = sorted(labs_by_cnpj.keys())
+
+        selected_cnpjs = st.multiselect(
+            "CNPJ Laboratórios (PCL)",
+            options=cnpj_options,
+            default=[],
+            placeholder="Todos os laboratórios"
+        )
+
+        # Converter CNPJs selecionados para lista de lab_ids
+        if selected_cnpjs:
+            selected_lab_ids = [labs_by_cnpj[cnpj]["id"] for cnpj in selected_cnpjs if cnpj in labs_by_cnpj]
+            # Mostrar labs selecionados
+            lab_names = [labs_by_cnpj[cnpj]["name"] for cnpj in selected_cnpjs if cnpj in labs_by_cnpj]
+            if len(lab_names) <= 3:
+                st.caption(f"🏢 {', '.join(lab_names)}")
+            else:
+                st.caption(f"🏢 {len(lab_names)} laboratórios selecionados")
+        else:
+            selected_lab_ids = None
+
+    st.markdown("---")
+
+    # Carregar dados com progress bar
+    # Para múltiplos labs, passar o primeiro ou None
+    first_lab_id = selected_lab_ids[0] if selected_lab_ids and len(selected_lab_ids) == 1 else None
+
+    tasks = [
+        ("Triagem", get_triagem_data, (first_lab_id, selected_month, selected_purpose)),
+        ("Confirmatório", get_confirmatorio_data, (first_lab_id, selected_month, selected_purpose)),
+        ("Confirmatório THC", get_confirmatorio_thc_data, (first_lab_id, selected_month, selected_purpose)),
+        ("RENACH", get_renach_data, (first_lab_id, selected_month, selected_purpose)),
+        ("Finalidades", get_samples_by_purpose, (first_lab_id, selected_month)),
+    ]
+    data = loading_with_progress(tasks, "Carregando visão geral...")
+    triagem_data = data["Triagem"]
+    confirmatorio_data = data["Confirmatório"]
+    confirmatorio_thc_data = data["Confirmatório THC"]
+    renach_data = data["RENACH"]
+    purpose_data = data["Finalidades"]
+
+    # Calcular métricas
+    total_triagem = triagem_data["positivo"] + triagem_data["negativo"]
+    total_confirmatorio = confirmatorio_data["positivo"] + confirmatorio_data["negativo"]
+    total_confirmatorio_thc = confirmatorio_thc_data["positivo"] + confirmatorio_thc_data["negativo"]
+
+    total_amostras = total_triagem + total_confirmatorio + total_confirmatorio_thc
+
+    # Calcular taxas por tipo de análise
+    taxa_triagem = (triagem_data["positivo"] / total_triagem * 100) if total_triagem > 0 else 0
+    taxa_confirmatorio = (confirmatorio_data["positivo"] / total_confirmatorio * 100) if total_confirmatorio > 0 else 0
+    taxa_confirmatorio_thc = (confirmatorio_thc_data["positivo"] / total_confirmatorio_thc * 100) if total_confirmatorio_thc > 0 else 0
+
+    # ========== KPIs NO TOPO ==========
+    st.markdown("### 📊 Indicadores Principais")
+
+    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+
+    with col_kpi1:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 20px; border-radius: 10px; text-align: center;
+                    border: 1px solid #00CED1;">
+            <p style="color: #888; margin: 0; font-size: 14px;">Total de Amostras</p>
+            <h2 style="color: #00CED1; margin: 5px 0;">{:,}</h2>
+        </div>
+        """.format(total_amostras).replace(",", "."), unsafe_allow_html=True)
+
+    with col_kpi2:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 20px; border-radius: 10px; text-align: center;">
+            <p style="color: #888; margin: 0; font-size: 14px;">Taxa Triagem</p>
+            <h2 style="color: {}; margin: 5px 0;">{:.2f}%</h2>
+        </div>
+        """.format("#FF6B6B" if taxa_triagem > 5 else "#FFD700" if taxa_triagem > 2 else "#00CED1", taxa_triagem), unsafe_allow_html=True)
+
+    with col_kpi3:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 20px; border-radius: 10px; text-align: center;">
+            <p style="color: #888; margin: 0; font-size: 14px;">Taxa Confirmatório</p>
+            <h2 style="color: {}; margin: 5px 0;">{:.2f}%</h2>
+        </div>
+        """.format("#FF6B6B" if taxa_confirmatorio > 5 else "#FFD700" if taxa_confirmatorio > 2 else "#00CED1", taxa_confirmatorio), unsafe_allow_html=True)
+
+    with col_kpi4:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 20px; border-radius: 10px; text-align: center;">
+            <p style="color: #888; margin: 0; font-size: 14px;">Taxa Confirm. THC</p>
+            <h2 style="color: {}; margin: 5px 0;">{:.2f}%</h2>
+        </div>
+        """.format("#FF6B6B" if taxa_confirmatorio_thc > 5 else "#FFD700" if taxa_confirmatorio_thc > 2 else "#00CED1", taxa_confirmatorio_thc), unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ========== GRÁFICO DE BARRAS EMPILHADAS: Comparação por Tipo de Análise ==========
+    st.markdown("### 📈 Comparação por Tipo de Análise")
+
+    # Preparar dados para barras empilhadas
+    df_analises = pd.DataFrame({
+        'Tipo': ['Triagem', 'Confirmatório', 'Confirm. THC'],
+        'Negativos': [triagem_data["negativo"], confirmatorio_data["negativo"], confirmatorio_thc_data["negativo"]],
+        'Positivos': [triagem_data["positivo"], confirmatorio_data["positivo"], confirmatorio_thc_data["positivo"]],
+        'Total': [total_triagem, total_confirmatorio, total_confirmatorio_thc]
+    })
+
+    # Calcular taxas
+    df_analises['Taxa (%)'] = df_analises.apply(
+        lambda row: round(row['Positivos'] / row['Total'] * 100, 2) if row['Total'] > 0 else 0, axis=1
+    )
+
+    if df_analises['Total'].sum() > 0:
+        # Criar gráfico de barras agrupadas
+        fig_barras = go.Figure()
+
+        # Barras de Negativos
+        fig_barras.add_trace(go.Bar(
+            name='Negativos',
+            x=df_analises['Tipo'],
+            y=df_analises['Negativos'],
+            marker_color='#00CED1',
+            text=df_analises['Negativos'].apply(lambda x: f"{x:,}".replace(",", ".")),
+            textposition='auto',
+            textfont=dict(size=12)
+        ))
+
+        # Barras de Positivos
+        fig_barras.add_trace(go.Bar(
+            name='Positivos',
+            x=df_analises['Tipo'],
+            y=df_analises['Positivos'],
+            marker_color='#FF6B6B',
+            text=df_analises['Positivos'].apply(lambda x: f"{x:,}".replace(",", ".")),
+            textposition='auto',
+            textfont=dict(size=12)
+        ))
+
+        fig_barras.update_layout(
+            barmode='group',
+            height=400,
+            margin=dict(t=30, b=50, l=50, r=30),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            xaxis_title="",
+            yaxis_title="Quantidade de Amostras"
+        )
+
+        st.plotly_chart(fig_barras, use_container_width=True, key="chart_visao_barras")
+    else:
+        st.warning("Nenhum dado encontrado para o período selecionado")
+
+    st.markdown("---")
+
+    # ========== RENACH E FINALIDADE LADO A LADO ==========
+    col5, col6 = st.columns(2)
+
+    with col5:
+        st.markdown("### 📋 Status RENACH")
+
+        total_renach = renach_data["no_renach"] + renach_data["fora_renach"]
+
+        if total_renach > 0:
+            pct_no_renach = (renach_data["no_renach"] / total_renach) * 100
+            pct_fora_renach = (renach_data["fora_renach"] / total_renach) * 100
+
+            df_renach = pd.DataFrame({
+                'Status': ['No RENACH', 'Fora do RENACH'],
+                'Quantidade': [renach_data["no_renach"], renach_data["fora_renach"]],
+                'Percentual': [pct_no_renach, pct_fora_renach]
+            })
+
+            fig_renach = px.pie(
+                df_renach,
+                values='Quantidade',
+                names='Status',
+                color='Status',
+                color_discrete_map={'No RENACH': '#00CED1', 'Fora do RENACH': '#FF6B6B'},
+                hole=0.4
+            )
+
+            fig_renach.update_traces(
+                textposition='inside',
+                textinfo='value+percent',
+                texttemplate='%{value:,.0f}<br>(%{percent:.1%})',
+                textfont_size=12
+            )
+
+            fig_renach.update_layout(
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
+                height=350,
+                margin=dict(t=20, b=50, l=20, r=20)
+            )
+
+            st.plotly_chart(fig_renach, use_container_width=True, key="chart_visao_renach")
+        else:
+            st.warning("Nenhum dado de RENACH encontrado")
+
+    with col6:
+        st.markdown("### 🎯 Amostras por Finalidade")
+
+        if purpose_data:
+            sorted_purposes = sorted(purpose_data.items(), key=lambda x: x[1], reverse=True)
+            finalidades_lista = [p[0] for p in sorted_purposes]
+            quantidades = [p[1] for p in sorted_purposes]
+            total_finalidade = sum(quantidades)
+
+            df_purpose = pd.DataFrame({
+                'Finalidade': finalidades_lista,
+                'Quantidade': quantidades
+            })
+
+            df_purpose['Percentual'] = (df_purpose['Quantidade'] / total_finalidade * 100).round(2)
+            df_purpose['Texto'] = df_purpose.apply(
+                lambda row: f"{row['Quantidade']:,} ({row['Percentual']:.1f}%)".replace(",", "."), axis=1
+            )
+
+            max_qtd = df_purpose['Quantidade'].max()
+
+            fig_purpose = px.bar(
+                df_purpose,
+                y='Finalidade',
+                x='Quantidade',
+                orientation='h',
+                text='Texto',
+                color='Quantidade',
+                color_continuous_scale=['#1A1A2E', '#00CED1']
+            )
+
+            fig_purpose.update_traces(
+                textposition='outside',
+                textfont_size=10,
+                cliponaxis=False
+            )
+
+            fig_purpose.update_layout(
+                showlegend=False,
+                height=350,
+                margin=dict(t=20, b=30, l=80, r=120),
+                xaxis_title="",
+                yaxis_title="",
+                xaxis=dict(range=[0, max_qtd * 1.3], showticklabels=False, showgrid=False),
+                coloraxis_showscale=False
+            )
+
+            st.plotly_chart(fig_purpose, use_container_width=True, key="chart_visao_finalidade")
+        else:
+            st.warning("Nenhum dado de finalidade encontrado")
+
+
+def render_perfil_demografico():
+    """Página de Perfil Demográfico por Substância"""
+    st.title("👤 Perfil Demográfico")
+    st.caption("Análise do perfil dos doadores que testaram positivo para cada substância")
+
+    # Mostrar período selecionado
+    periodo_inicio, periodo_fim = get_selected_period()
+    st.info(f"📅 **Período:** {periodo_inicio.strftime('%d/%m/%Y')} a {periodo_fim.strftime('%d/%m/%Y')} *(altere na sidebar)*")
+
+    # Filtros
+    st.markdown("### 🔍 Filtros")
+
+    col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
+
+    # Filtro de Mês
+    with col_filtro1:
+        meses = {
+            "Todos": None,
+            "Janeiro": 1,
+            "Fevereiro": 2,
+            "Março": 3,
+            "Abril": 4,
+            "Maio": 5,
+            "Junho": 6,
+            "Julho": 7,
+            "Agosto": 8,
+            "Setembro": 9,
+            "Outubro": 10,
+            "Novembro": 11,
+            "Dezembro": 12
+        }
+        selected_mes_name = st.selectbox(
+            "Mês",
+            options=list(meses.keys()),
+            index=0,
+            key="demo_filtro_mes"
+        )
+        selected_month = meses[selected_mes_name]
+
+    # Filtro de Finalidade
+    with col_filtro2:
+        finalidades = {
+            "Todas": None,
+            "CLT": "clt",
+            "CLT + CNH": "cltCnh",
+            "Concurso Público": "civilService",
+        }
+        selected_finalidade_name = st.selectbox(
+            "Finalidade da Amostra",
+            options=list(finalidades.keys()),
+            index=0,
+            key="demo_filtro_finalidade"
+        )
+        selected_purpose = finalidades[selected_finalidade_name]
+
     # Filtro de Laboratório por CNPJ
     with col_filtro3:
         labs_by_cnpj = get_laboratories_by_cnpj()
@@ -1564,7 +1945,8 @@ def render_visao_geral():
         selected_cnpj = st.selectbox(
             "CNPJ Laboratório (PCL)",
             options=cnpj_options,
-            index=0
+            index=0,
+            key="demo_filtro_cnpj"
         )
 
         if selected_cnpj and selected_cnpj != "Todos":
@@ -1586,320 +1968,270 @@ def render_visao_geral():
 
     st.markdown("---")
 
-    with st.spinner("Carregando dados..."):
-        triagem_data = get_triagem_data(selected_lab_id, selected_month, selected_purpose)
-        confirmatorio_data = get_confirmatorio_data(selected_lab_id, selected_month, selected_purpose)
-        confirmatorio_thc_data = get_confirmatorio_thc_data(selected_lab_id, selected_month, selected_purpose)
-        renach_data = get_renach_data(selected_lab_id, selected_month, selected_purpose)
-        purpose_data = get_samples_by_purpose(selected_lab_id, selected_month)
-
-    # Contagem de amostras (soma de todos os tipos de análise)
-    total_amostras = (
-        triagem_data["positivo"] + triagem_data["negativo"] +
-        confirmatorio_data["positivo"] + confirmatorio_data["negativo"] +
-        confirmatorio_thc_data["positivo"] + confirmatorio_thc_data["negativo"]
+    # Carregar dados demográficos completos
+    df_demo_raw = loading_single(
+        get_demographic_raw_data,
+        "Carregando dados demográficos...",
+        selected_lab_id, selected_month, selected_purpose
     )
 
-    # Preencher título com contagem ao lado
-    with titulo_placeholder.container():
-        col_titulo, col_contagem = st.columns([3, 1])
-        with col_titulo:
-            st.title("🏠 Visão Geral")
-        with col_contagem:
-            st.metric("Amostras", f"{total_amostras:,}")
+    if df_demo_raw is not None and not df_demo_raw.empty:
+        # Lista de substâncias disponíveis
+        substancias_disponiveis = sorted(df_demo_raw["substancia"].unique().tolist())
 
+        # Selectbox para escolher substância
+        col_select, col_empty = st.columns([1, 2])
+        with col_select:
+            # Inicializar session state se necessário
+            if "substancia_selecionada" not in st.session_state:
+                st.session_state.substancia_selecionada = None
 
-    # Grid 2x2 para os gráficos
-    col1, col2 = st.columns(2)
-
-    # Gráfico de Triagem (canto superior esquerdo)
-    with col1:
-        st.subheader("Triagem")
-
-        total_triagem = triagem_data["positivo"] + triagem_data["negativo"]
-
-        if total_triagem > 0:
-            # Calcular percentuais
-            pct_negativo = (triagem_data["negativo"] / total_triagem) * 100
-            pct_positivo = (triagem_data["positivo"] / total_triagem) * 100
-
-            # Criar dataframe para o gráfico
-            df_triagem = pd.DataFrame({
-                'Status': ['Negativo', 'Positivo'],
-                'Quantidade': [triagem_data["negativo"], triagem_data["positivo"]],
-                'Percentual': [pct_negativo, pct_positivo]
-            })
-
-            # Criar gráfico de pizza
-            fig = px.pie(
-                df_triagem,
-                values='Quantidade',
-                names='Status',
-                color='Status',
-                color_discrete_map={'Negativo': '#00CED1', 'Positivo': '#1A1A2E'},
-                hole=0.4
+            substancia_escolhida = st.selectbox(
+                "Selecione uma substância para análise detalhada:",
+                options=["Top 5 Substâncias"] + substancias_disponiveis,
+                key="select_substancia_demo"
             )
 
-            fig.update_traces(
-                textposition='inside',
-                textinfo='value+percent',
-                texttemplate='%{value:,.0f}<br>(%{percent:.2%})',
-                textfont_size=12
-            )
-
-            fig.update_layout(
-                showlegend=True,
-                legend_title_text='Substâncias Detectadas',
-                height=400,
-                margin=dict(t=30, b=30, l=50, r=50)
-            )
-
-            st.plotly_chart(fig, use_container_width=True, key="chart_visao_triagem_pizza")
+        # Atualizar session state
+        if substancia_escolhida == "Top 5 Substâncias":
+            st.session_state.substancia_selecionada = None
         else:
-            st.warning("Nenhum dado de triagem encontrado")
+            st.session_state.substancia_selecionada = substancia_escolhida
 
-    # Gráfico de Quantidade de Amostras por Status de Positividade (soma de todos os tipos)
-    with col2:
-        st.subheader("Amostras por Resultado")
+        st.markdown("---")
 
-        # Somar todos os tipos de análises
-        total_positivo = triagem_data["positivo"] + confirmatorio_data["positivo"] + confirmatorio_thc_data["positivo"]
-        total_negativo = triagem_data["negativo"] + confirmatorio_data["negativo"] + confirmatorio_thc_data["negativo"]
-        total_geral = total_positivo + total_negativo
+        if st.session_state.substancia_selecionada is None:
+            # MODO TOP 5: Mostrar cards das 5 substâncias com mais positivos
+            st.markdown("### 🏆 Top 5 Substâncias - Perfil Mais Comum")
 
-        if total_geral > 0:
-            # Calcular percentuais
-            pct_negativo = (total_negativo / total_geral) * 100
-            pct_positivo = (total_positivo / total_geral) * 100
+            # Contar total de positivos por substância
+            contagem_substancias = df_demo_raw.groupby("substancia").size().reset_index(name="total")
+            contagem_substancias = contagem_substancias.sort_values("total", ascending=False)
+            top_5_substancias = contagem_substancias.head(5)["substancia"].tolist()
 
-            # Criar dataframe para o gráfico
-            df_total = pd.DataFrame({
-                'Status': ['Negativo', 'Positivo'],
-                'Quantidade': [total_negativo, total_positivo],
-                'Percentual': [pct_negativo, pct_positivo]
-            })
+            # Criar cards para cada substância do top 5
+            for i, substancia in enumerate(top_5_substancias):
+                df_sub = df_demo_raw[df_demo_raw["substancia"] == substancia]
+                total_positivos = len(df_sub)
 
-            # Criar gráfico de pizza
-            fig_total = px.pie(
-                df_total,
-                values='Quantidade',
-                names='Status',
-                color='Status',
-                color_discrete_map={'Negativo': '#00CED1', 'Positivo': '#1A1A2E'},
-                hole=0.4
-            )
+                # Perfil mais comum
+                perfil = df_sub.groupby(["sexo", "faixa_etaria", "purposeType", "purposeSubType"]).size().reset_index(name="qtd")
+                if not perfil.empty:
+                    top_perfil = perfil.nlargest(1, "qtd").iloc[0]
 
-            fig_total.update_traces(
-                textposition='inside',
-                textinfo='value+percent',
-                texttemplate='%{value:,.0f}<br>(%{percent:.2%})',
-                textfont_size=12
-            )
+                    sexo = top_perfil["sexo"]
+                    faixa = top_perfil["faixa_etaria"]
+                    tipo_exame = top_perfil["purposeType"]
+                    subtipo = top_perfil["purposeSubType"]
+                    qtd_perfil = int(top_perfil["qtd"])
 
-            fig_total.update_layout(
-                showlegend=True,
-                legend_title_text='Substâncias Detectadas',
-                height=400,
-                margin=dict(t=30, b=30, l=50, r=50)
-            )
+                    # Formatar subtipo
+                    subtipos_map = {
+                        "firstCnh": "primeira habilitação",
+                        "renovation": "renovação",
+                        "categoryChange": "mudança de categoria"
+                    }
+                    subtipo_texto = f" ({subtipos_map.get(subtipo, subtipo)})" if subtipo else ""
 
-            st.plotly_chart(fig_total, use_container_width=True, key="chart_visao_triagem")
+                    # Formatar tipo exame
+                    tipos_map = {
+                        "cnh": "CNH",
+                        "admissional": "Admissional",
+                        "periodico": "Periódico",
+                        "demissional": "Demissional"
+                    }
+                    tipo_formatado = tipos_map.get(tipo_exame, tipo_exame) if tipo_exame else "N/A"
+
+                    # Card visual
+                    medal = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][i]
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                                padding: 20px; border-radius: 10px; margin-bottom: 15px;
+                                border-left: 4px solid {'#FFD700' if i == 0 else '#C0C0C0' if i == 1 else '#CD7F32' if i == 2 else '#4a4a6a'};">
+                        <h4 style="margin: 0; color: white;">{medal} {substancia}</h4>
+                        <p style="color: #aaa; margin: 5px 0 0 0; font-size: 14px;">
+                            <b>{total_positivos}</b> positivos | Perfil mais comum: <b>{sexo}</b>, <b>{faixa}</b> anos,
+                            exame <b>{tipo_formatado}</b>{subtipo_texto} ({qtd_perfil} casos)
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
         else:
-            st.warning("Nenhum dado encontrado")
+            # MODO DETALHADO: Análise da substância selecionada
+            substancia = st.session_state.substancia_selecionada
+            df_sub = df_demo_raw[df_demo_raw["substancia"] == substancia]
+            total_positivos = len(df_sub)
 
-    col3, col4 = st.columns(2)
+            st.markdown(f"### 🔬 Análise Detalhada: {substancia}")
+            st.markdown(f"**Total de positivos:** {total_positivos}")
 
-    # Gráfico de Confirmatório (canto inferior esquerdo)
-    with col3:
-        st.subheader("Confirmatório")
+            # Perfil mais comum
+            perfil = df_sub.groupby(["sexo", "faixa_etaria", "purposeType", "purposeSubType"]).size().reset_index(name="qtd")
+            if not perfil.empty:
+                top_perfil = perfil.nlargest(1, "qtd").iloc[0]
 
-        total_confirmatorio = confirmatorio_data["positivo"] + confirmatorio_data["negativo"]
+                subtipos_map = {"firstCnh": "primeira habilitação", "renovation": "renovação", "categoryChange": "mudança de categoria"}
+                tipos_map = {"cnh": "CNH", "admissional": "Admissional", "periodico": "Periódico", "demissional": "Demissional"}
 
-        if total_confirmatorio > 0:
-            # Calcular percentuais
-            pct_negativo = (confirmatorio_data["negativo"] / total_confirmatorio) * 100
-            pct_positivo = (confirmatorio_data["positivo"] / total_confirmatorio) * 100
+                subtipo_texto = f" ({subtipos_map.get(top_perfil['purposeSubType'], top_perfil['purposeSubType'])})" if top_perfil['purposeSubType'] else ""
+                tipo_formatado = tipos_map.get(top_perfil['purposeType'], top_perfil['purposeType']) if top_perfil['purposeType'] else "N/A"
 
-            # Criar dataframe para o gráfico
-            df_confirmatorio = pd.DataFrame({
-                'Status': ['Negativo', 'Positivo'],
-                'Quantidade': [confirmatorio_data["negativo"], confirmatorio_data["positivo"]],
-                'Percentual': [pct_negativo, pct_positivo]
-            })
+                st.success(
+                    f"**Perfil mais comum:** {top_perfil['sexo']}, {top_perfil['faixa_etaria']} anos, "
+                    f"exame {tipo_formatado}{subtipo_texto} — **{int(top_perfil['qtd'])} casos**"
+                )
 
-            # Criar gráfico de pizza
-            fig_conf = px.pie(
-                df_confirmatorio,
-                values='Quantidade',
-                names='Status',
-                color='Status',
-                color_discrete_map={'Negativo': '#00CED1', 'Positivo': '#1A1A2E'},
-                hole=0.4
-            )
+            st.markdown("---")
 
-            fig_conf.update_traces(
-                textposition='inside',
-                textinfo='value+percent',
-                texttemplate='%{value:,.0f}<br>(%{percent:.2%})',
-                textfont_size=12
-            )
+            # Gráficos lado a lado: Estado e Sexo
+            col_estado, col_sexo = st.columns(2)
 
-            fig_conf.update_layout(
-                showlegend=True,
-                legend_title_text='Substâncias Detectadas',
-                height=400,
-                margin=dict(t=30, b=30, l=50, r=50)
-            )
+            with col_estado:
+                st.markdown("#### 📍 Recorrência por Estado")
+                if "estado" in df_sub.columns:
+                    # Extrair código do estado (pode vir como dict com code/name)
+                    def extrair_estado(val):
+                        if isinstance(val, dict):
+                            return val.get("code", val.get("name", "N/A"))
+                        return val if val else "N/A"
 
-            st.plotly_chart(fig_conf, use_container_width=True, key="chart_visao_confirmatorio")
-        else:
-            st.warning("Nenhum dado de confirmatório encontrado")
+                    df_sub = df_sub.copy()
+                    df_sub["estado_str"] = df_sub["estado"].apply(extrair_estado)
 
-    # Gráfico de Confirmatório THC (canto inferior direito)
-    with col4:
-        st.subheader("Confirmatório THC")
+                    estado_counts = df_sub["estado_str"].value_counts().reset_index()
+                    estado_counts.columns = ["Estado", "Quantidade"]
+                    # Filtrar N/A, None e vazios
+                    estado_counts = estado_counts[
+                        (estado_counts["Estado"] != "N/A") &
+                        (estado_counts["Estado"].notna()) &
+                        (estado_counts["Estado"] != "")
+                    ].head(10)
 
-        total_confirmatorio_thc = confirmatorio_thc_data["positivo"] + confirmatorio_thc_data["negativo"]
+                    if not estado_counts.empty:
+                        fig_estado = px.bar(
+                            estado_counts,
+                            x="Quantidade",
+                            y="Estado",
+                            orientation="h",
+                            text="Quantidade",
+                            color="Quantidade",
+                            color_continuous_scale=["#00CED1", "#FF6B6B"]
+                        )
+                        fig_estado.update_traces(
+                            textposition="outside",
+                            texttemplate="%{text:,.0f}",
+                            cliponaxis=False
+                        )
+                        fig_estado.update_layout(
+                            height=400,
+                            margin=dict(t=20, b=20, l=50, r=120),
+                            yaxis=dict(autorange="reversed"),
+                            coloraxis_showscale=False,
+                            xaxis_title="",
+                            yaxis_title="",
+                            xaxis=dict(range=[0, estado_counts["Quantidade"].max() * 1.25])
+                        )
+                        st.plotly_chart(fig_estado, use_container_width=True, key="chart_estado_demo")
+                    else:
+                        st.info("Dados de estado não disponíveis")
+                else:
+                    st.info("Dados de estado não disponíveis")
 
-        if total_confirmatorio_thc > 0:
-            # Calcular percentuais
-            pct_negativo = (confirmatorio_thc_data["negativo"] / total_confirmatorio_thc) * 100
-            pct_positivo = (confirmatorio_thc_data["positivo"] / total_confirmatorio_thc) * 100
+            with col_sexo:
+                st.markdown("#### 👫 Recorrência por Sexo")
+                sexo_counts = df_sub["sexo"].value_counts().reset_index()
+                sexo_counts.columns = ["Sexo", "Quantidade"]
 
-            # Criar dataframe para o gráfico
-            df_confirmatorio_thc = pd.DataFrame({
-                'Status': ['Negativo', 'Positivo'],
-                'Quantidade': [confirmatorio_thc_data["negativo"], confirmatorio_thc_data["positivo"]],
-                'Percentual': [pct_negativo, pct_positivo]
-            })
+                if not sexo_counts.empty:
+                    fig_sexo = px.pie(
+                        sexo_counts,
+                        values="Quantidade",
+                        names="Sexo",
+                        color="Sexo",
+                        color_discrete_map={"Masculino": "#4169E1", "Feminino": "#FF69B4", "N/A": "#808080"},
+                        hole=0.4
+                    )
+                    fig_sexo.update_traces(textposition="inside", textinfo="percent+value")
+                    fig_sexo.update_layout(
+                        height=350,
+                        margin=dict(t=20, b=20, l=20, r=20),
+                        showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5)
+                    )
+                    st.plotly_chart(fig_sexo, use_container_width=True, key="chart_sexo_demo")
 
-            # Criar gráfico de pizza
-            fig_thc = px.pie(
-                df_confirmatorio_thc,
-                values='Quantidade',
-                names='Status',
-                color='Status',
-                color_discrete_map={'Negativo': '#00CED1', 'Positivo': '#1A1A2E'},
-                hole=0.4
-            )
+            st.markdown("---")
 
-            fig_thc.update_traces(
-                textposition='inside',
-                textinfo='value+percent',
-                texttemplate='%{value:,.0f}<br>(%{percent:.2%})',
-                textfont_size=12
-            )
+            # Gráficos de idade por sexo
+            st.markdown("#### 📊 Distribuição por Faixa Etária")
 
-            fig_thc.update_layout(
-                showlegend=True,
-                legend_title_text='Substâncias Detectadas',
-                height=400,
-                margin=dict(t=30, b=30, l=50, r=50)
-            )
+            col_masc, col_fem = st.columns(2)
 
-            st.plotly_chart(fig_thc, use_container_width=True, key="chart_visao_confirmatorio_thc")
-        else:
-            st.warning("Nenhum dado de confirmatório THC encontrado")
+            # Ordem das faixas etárias
+            ordem_faixas = ["< 18", "18-24", "25-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60+"]
 
-    # Terceira linha - Gráfico de RENACH
-    col5, col6 = st.columns(2)
+            with col_masc:
+                st.markdown("##### 👨 Homens")
+                df_masc = df_sub[df_sub["sexo"] == "Masculino"]
+                if not df_masc.empty:
+                    idade_masc = df_masc["faixa_etaria"].value_counts().reset_index()
+                    idade_masc.columns = ["Faixa Etária", "Quantidade"]
+                    # Ordenar
+                    idade_masc["ordem"] = idade_masc["Faixa Etária"].apply(lambda x: ordem_faixas.index(x) if x in ordem_faixas else 99)
+                    idade_masc = idade_masc.sort_values("ordem").drop("ordem", axis=1)
 
-    with col5:
-        st.subheader("Status RENACH")
+                    fig_masc = px.bar(
+                        idade_masc,
+                        x="Faixa Etária",
+                        y="Quantidade",
+                        text="Quantidade",
+                        color="Quantidade",
+                        color_continuous_scale=["#87CEEB", "#4169E1"]
+                    )
+                    fig_masc.update_traces(textposition="outside")
+                    fig_masc.update_layout(
+                        height=400,
+                        margin=dict(t=30, b=50, l=20, r=20),
+                        coloraxis_showscale=False,
+                        xaxis_title="",
+                        yaxis_title="Quantidade"
+                    )
+                    st.plotly_chart(fig_masc, use_container_width=True, key="chart_idade_masc")
+                else:
+                    st.info("Nenhum dado masculino")
 
-        total_renach = renach_data["no_renach"] + renach_data["fora_renach"]
+            with col_fem:
+                st.markdown("##### 👩 Mulheres")
+                df_fem = df_sub[df_sub["sexo"] == "Feminino"]
+                if not df_fem.empty:
+                    idade_fem = df_fem["faixa_etaria"].value_counts().reset_index()
+                    idade_fem.columns = ["Faixa Etária", "Quantidade"]
+                    # Ordenar
+                    idade_fem["ordem"] = idade_fem["Faixa Etária"].apply(lambda x: ordem_faixas.index(x) if x in ordem_faixas else 99)
+                    idade_fem = idade_fem.sort_values("ordem").drop("ordem", axis=1)
 
-        if total_renach > 0:
-            # Calcular percentuais
-            pct_no_renach = (renach_data["no_renach"] / total_renach) * 100
-            pct_fora_renach = (renach_data["fora_renach"] / total_renach) * 100
+                    fig_fem = px.bar(
+                        idade_fem,
+                        x="Faixa Etária",
+                        y="Quantidade",
+                        text="Quantidade",
+                        color="Quantidade",
+                        color_continuous_scale=["#FFB6C1", "#FF69B4"]
+                    )
+                    fig_fem.update_traces(textposition="outside")
+                    fig_fem.update_layout(
+                        height=400,
+                        margin=dict(t=30, b=50, l=20, r=20),
+                        coloraxis_showscale=False,
+                        xaxis_title="",
+                        yaxis_title="Quantidade"
+                    )
+                    st.plotly_chart(fig_fem, use_container_width=True, key="chart_idade_fem")
+                else:
+                    st.info("Nenhum dado feminino")
 
-            # Criar dataframe para o gráfico
-            df_renach = pd.DataFrame({
-                'Status': ['No RENACH', 'Fora do RENACH'],
-                'Quantidade': [renach_data["no_renach"], renach_data["fora_renach"]],
-                'Percentual': [pct_no_renach, pct_fora_renach]
-            })
-
-            # Criar gráfico de pizza
-            fig_renach = px.pie(
-                df_renach,
-                values='Quantidade',
-                names='Status',
-                color='Status',
-                color_discrete_map={'No RENACH': '#00CED1', 'Fora do RENACH': '#1A1A2E'},
-                hole=0.4
-            )
-
-            fig_renach.update_traces(
-                textposition='inside',
-                textinfo='value+percent',
-                texttemplate='%{value:,.0f}<br>(%{percent:.2%})',
-                textfont_size=12
-            )
-
-            fig_renach.update_layout(
-                showlegend=True,
-                legend_title_text='Status RENACH',
-                height=400,
-                margin=dict(t=30, b=30, l=50, r=50)
-            )
-
-            st.plotly_chart(fig_renach, use_container_width=True, key="chart_visao_renach")
-        else:
-            st.warning("Nenhum dado de RENACH encontrado")
-
-    # Gráfico de Amostras por Finalidade
-    with col6:
-        st.subheader("Amostras por Finalidade")
-
-        if purpose_data:
-            # Ordenar por quantidade (decrescente)
-            sorted_purposes = sorted(purpose_data.items(), key=lambda x: x[1], reverse=True)
-            finalidades = [p[0] for p in sorted_purposes]
-            quantidades = [p[1] for p in sorted_purposes]
-            total_finalidade = sum(quantidades)
-
-            # Criar dataframe para o gráfico
-            df_purpose = pd.DataFrame({
-                'Finalidade': finalidades,
-                'Quantidade': quantidades
-            })
-
-            # Calcular percentuais
-            df_purpose['Percentual'] = (df_purpose['Quantidade'] / total_finalidade * 100).round(2)
-            df_purpose['Texto'] = df_purpose.apply(
-                lambda row: f"{row['Quantidade']:,} ({row['Percentual']:.1f}%)".replace(",", "."), axis=1
-            )
-
-            # Criar gráfico de barras horizontais
-            fig_purpose = px.bar(
-                df_purpose,
-                y='Finalidade',
-                x='Quantidade',
-                orientation='h',
-                text='Texto',
-                color='Quantidade',
-                color_continuous_scale=['#1A1A2E', '#00CED1']
-            )
-
-            fig_purpose.update_traces(
-                textposition='outside',
-                textfont_size=10
-            )
-
-            fig_purpose.update_layout(
-                showlegend=False,
-                height=400,
-                margin=dict(t=30, b=30, l=50, r=80),
-                xaxis_title="Quantidade",
-                yaxis_title="",
-                coloraxis_showscale=False
-            )
-
-            st.plotly_chart(fig_purpose, use_container_width=True, key="chart_visao_finalidade")
-        else:
-            st.warning("Nenhum dado de finalidade encontrado")
+    else:
+        st.info("Nenhum dado demográfico disponível para o período selecionado")
 
 
 def get_monthly_positivity_data(
@@ -2875,30 +3207,28 @@ def render_taxa_positividade():
         "end_date_filter": end_date_filter
     }
 
-    with st.spinner("Carregando dados em paralelo..."):
-        # Definir tarefas para execução paralela
-        tasks = {
-            "monthly_data": (get_monthly_positivity_data, (), common_params),
-            "metrics": (get_metrics_data, (), common_params),
-        }
+    # Carregar dados com progress bar
+    tasks_list = [
+        ("Dados mensais", get_monthly_positivity_data, (), common_params),
+        ("Métricas", get_metrics_data, (), common_params),
+    ]
 
-        # Se houver laboratórios selecionados, adicionar tarefa de dados por lab
-        if lab_ids_filter and len(lab_ids_filter) > 0:
-            tasks["data_by_lab"] = (get_monthly_data_by_lab, (), common_params)
+    # Se houver laboratórios selecionados, adicionar tarefa de dados por lab
+    if lab_ids_filter and len(lab_ids_filter) > 0:
+        tasks_list.append(("Dados por laboratório", get_monthly_data_by_lab, (), common_params))
 
-        # Executar todas as tarefas em paralelo
-        results = run_parallel_tasks(tasks, max_workers=3)
+    results = loading_with_progress(tasks_list, "Carregando taxa de positividade...")
 
-        monthly_data = results.get("monthly_data", {})
-        metrics = results.get("metrics", {
-            "negativas_triagem": 0, "positivas_triagem": 0,
-            "negativas_confirmatorio": 0, "positivas_confirmatorio": 0,
-            "total_amostras": 0, "taxa_geral": 0.0
-        })
-        data_by_lab = results.get("data_by_lab", {})
+    monthly_data = results.get("Dados mensais", {})
+    metrics = results.get("Métricas", {
+        "negativas_triagem": 0, "positivas_triagem": 0,
+        "negativas_confirmatorio": 0, "positivas_confirmatorio": 0,
+        "total_amostras": 0, "taxa_geral": 0.0
+    })
+    data_by_lab = results.get("Dados por laboratório", {})
 
-        # Buscar taxa média nacional para comparação
-        taxa_nacional = get_national_average_rate(start_date_filter, end_date_filter)
+    # Buscar taxa média nacional para comparação
+    taxa_nacional = get_national_average_rate(start_date_filter, end_date_filter)
 
     # Função para formatar números com ponto como separador de milhares
     def format_number(n: int) -> str:
@@ -3149,23 +3479,22 @@ def render_taxa_positividade():
     # ============================================
     st.subheader("Análises Detalhadas")
 
-    # Buscar dados para os gráficos analíticos em paralelo
-    with st.spinner("Carregando análises detalhadas em paralelo..."):
-        detailed_tasks = {
-            "substance": (get_positivity_by_substance, (lab_ids_filter, start_date_filter, end_date_filter)),
-            "state": (get_positivity_by_state, (lab_ids_filter, start_date_filter, end_date_filter)),
-            "purpose": (get_positivity_by_purpose, (lab_ids_filter, start_date_filter, end_date_filter)),
-            "lot_type": (get_positivity_by_lot_type, (lab_ids_filter, start_date_filter, end_date_filter)),
-            "renach": (get_positivity_by_renach, (lab_ids_filter, start_date_filter, end_date_filter)),
-        }
+    # Buscar dados para os gráficos analíticos com progress bar
+    detailed_tasks = [
+        ("Substâncias", get_positivity_by_substance, (lab_ids_filter, start_date_filter, end_date_filter)),
+        ("Estados", get_positivity_by_state, (lab_ids_filter, start_date_filter, end_date_filter)),
+        ("Finalidades", get_positivity_by_purpose, (lab_ids_filter, start_date_filter, end_date_filter)),
+        ("Tipos de lote", get_positivity_by_lot_type, (lab_ids_filter, start_date_filter, end_date_filter)),
+        ("RENACH", get_positivity_by_renach, (lab_ids_filter, start_date_filter, end_date_filter)),
+    ]
 
-        detailed_results = run_parallel_tasks(detailed_tasks, max_workers=5)
+    detailed_results = loading_with_progress(detailed_tasks, "Carregando análises detalhadas...")
 
-        substance_data = detailed_results.get("substance", {})
-        state_data = detailed_results.get("state", {})
-        purpose_data = detailed_results.get("purpose", {})
-        lot_type_data = detailed_results.get("lot_type", {})
-        renach_status_data = detailed_results.get("renach", {})
+    substance_data = detailed_results.get("Substâncias", {})
+    state_data = detailed_results.get("Estados", {})
+    purpose_data = detailed_results.get("Finalidades", {})
+    lot_type_data = detailed_results.get("Tipos de lote", {})
+    renach_status_data = detailed_results.get("RENACH", {})
 
     # Primeira linha: Substâncias - gráfico de barras horizontal
     st.markdown("#### Positividade por Substância")
@@ -3474,182 +3803,572 @@ def render_substancias():
 
     st.markdown("---")
 
-    with st.spinner("Carregando dados de substâncias..."):
-        substance_stats = get_substance_statistics(selected_lab_id, selected_month, selected_analysis)
+    substance_stats = loading_single(
+        get_substance_statistics, "Carregando dados de substâncias...",
+        selected_lab_id, selected_month, selected_analysis
+    )
 
     if not substance_stats:
         st.warning("Nenhum dado encontrado para os filtros selecionados")
         return
 
     # Preparar dados para visualização
+    # Total de amostras é calculado usando qualquer substância (todas têm o mesmo total)
+    # pois todas as substâncias são analisadas em cada amostra
+    primeira_substancia = list(substance_stats.values())[0]
+    total_amostras = primeira_substancia["total"]
+
     df_stats = pd.DataFrame([
         {
             "Substância": name,
-            "Total Análises": data["total"],
             "Positivos": data["positivos"],
-            "Negativos": data["negativos"],
-            "Taxa Positividade (%)": data["taxa"]
+            "Taxa Positividade (%)": round(data["positivos"] / total_amostras * 100, 2) if total_amostras > 0 else 0
         }
         for name, data in substance_stats.items()
     ])
 
-    # Ordenar por total de positivos (ranking)
-    df_stats = df_stats.sort_values("Positivos", ascending=False)
+    # Ordenar por taxa de positividade (maior primeiro)
+    df_stats = df_stats.sort_values("Taxa Positividade (%)", ascending=False)
 
-    # Cards de resumo
-    col1, col2, col3, col4 = st.columns(4)
+    # Cards de substâncias ordenados por taxa de positividade
+    st.subheader("🧪 Substâncias por Taxa de Positividade")
+    st.caption(f"Total de amostras analisadas: **{total_amostras:,}**".replace(",", "."))
 
-    total_analises = df_stats["Total Análises"].sum()
-    total_positivos = df_stats["Positivos"].sum()
-    total_negativos = df_stats["Negativos"].sum()
-    taxa_geral = (total_positivos / total_analises * 100) if total_analises > 0 else 0
+    # Mostrar cards em grid (4 por linha)
+    substancias_com_positivos = df_stats[df_stats["Positivos"] > 0]
 
-    with col1:
-        st.metric("Total de Análises", f"{total_analises:,}".replace(",", "."))
-    with col2:
-        st.metric("Total Positivos", f"{total_positivos:,}".replace(",", "."))
-    with col3:
-        st.metric("Total Negativos", f"{total_negativos:,}".replace(",", "."))
-    with col4:
-        st.metric("Taxa Geral", f"{taxa_geral:.2f}%")
+    if not substancias_com_positivos.empty:
+        # Criar linhas de 4 cards
+        for i in range(0, len(substancias_com_positivos), 4):
+            cols = st.columns(4)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx < len(substancias_com_positivos):
+                    row = substancias_com_positivos.iloc[idx]
+                    with col:
+                        st.metric(
+                            label=row["Substância"],
+                            value=f"{row['Taxa Positividade (%)']:.2f}%",
+                            delta=f"{int(row['Positivos'])} positivos",
+                            delta_color="inverse"
+                        )
+    else:
+        st.info("Nenhuma substância com resultado positivo no período")
 
-    st.markdown("---")
 
-    # Gráficos lado a lado
-    col_g1, col_g2 = st.columns(2)
+def get_demographic_raw_data(laboratory_id: str = None, month: int = None, analysis_type: str = "all") -> pd.DataFrame:
+    """
+    Retorna dados demográficos brutos para análise.
+    Inclui: substancia, sexo, faixa_etaria, estado, purposeType, purposeSubType
+    """
+    selected_start, selected_end = get_selected_period()
+    cache_key = generate_cache_key("demographic_raw", laboratory_id, month, analysis_type, selected_start.isoformat(), selected_end.isoformat())
+    cached = get_cached_data("demographic_raw", cache_key)
+    if cached is not None:
+        return cached
 
-    with col_g1:
-        st.subheader("🏆 Ranking de Positividade")
+    try:
+        client = get_mongo_client()
+        db = client["ctox"]
 
-        # Top 15 substâncias com mais positivos
-        df_top = df_stats.head(15).copy()
-
-        if not df_top.empty:
-            df_top["Texto"] = df_top.apply(
-                lambda row: f"{row['Positivos']:,} ({row['Taxa Positividade (%)']:.1f}%)".replace(",", "."),
-                axis=1
-            )
-
-            fig_ranking = px.bar(
-                df_top,
-                y="Substância",
-                x="Positivos",
-                orientation="h",
-                text="Texto",
-                color="Taxa Positividade (%)",
-                color_continuous_scale=["#1A1A2E", "#FF6B6B"]
-            )
-
-            fig_ranking.update_traces(textposition="outside", textfont_size=9)
-            fig_ranking.update_layout(
-                height=500,
-                margin=dict(t=30, b=30, l=150, r=80),
-                xaxis_title="Quantidade de Positivos",
-                yaxis_title="",
-                yaxis=dict(autorange="reversed"),
-                coloraxis_showscale=False
-            )
-
-            st.plotly_chart(fig_ranking, use_container_width=True, key="chart_ranking_substancias")
-
-    with col_g2:
-        st.subheader("📊 Taxa de Positividade por Substância")
-
-        # Top 15 por taxa de positividade (com mínimo de análises)
-        df_taxa = df_stats[df_stats["Total Análises"] >= 10].copy()
-        df_taxa = df_taxa.sort_values("Taxa Positividade (%)", ascending=False).head(15)
-
-        if not df_taxa.empty:
-            df_taxa["Texto"] = df_taxa.apply(
-                lambda row: f"{row['Taxa Positividade (%)']:.1f}%",
-                axis=1
-            )
-
-            fig_taxa = px.bar(
-                df_taxa,
-                y="Substância",
-                x="Taxa Positividade (%)",
-                orientation="h",
-                text="Texto",
-                color="Taxa Positividade (%)",
-                color_continuous_scale=["#00CED1", "#FF6B6B"]
-            )
-
-            fig_taxa.update_traces(textposition="outside", textfont_size=10)
-            fig_taxa.update_layout(
-                height=500,
-                margin=dict(t=30, b=30, l=150, r=50),
-                xaxis_title="Taxa de Positividade (%)",
-                yaxis_title="",
-                yaxis=dict(autorange="reversed"),
-                coloraxis_showscale=False
-            )
-
-            st.plotly_chart(fig_taxa, use_container_width=True, key="chart_taxa_substancias")
+        # Período
+        if month:
+            year = datetime.now().year
+            start_date = datetime(year, month, 1)
+            if month == 12:
+                end_date = datetime(year, 12, 31, 23, 59, 59)
+            else:
+                end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
         else:
-            st.info("Nenhuma substância com 10+ análises")
+            start_date = selected_start
+            end_date = selected_end
 
-    st.markdown("---")
+        # Tipos de análise
+        if analysis_type == "all":
+            analysis_types = ["screening", "confirmatory", "confirmatoryTHC"]
+        else:
+            analysis_types = [analysis_type]
 
-    # Gráfico de frequência (distribuição)
-    st.subheader("📈 Frequência de Análises por Substância")
+        # Buscar lotes do período
+        lots_collection = db["lots"]
+        lots = list(lots_collection.find(
+            {
+                "analysisType": {"$in": analysis_types},
+                "createdAt": {"$gte": start_date, "$lte": end_date}
+            },
+            {"code": 1}
+        ))
 
-    df_freq = df_stats.sort_values("Total Análises", ascending=False).head(20)
+        if not lots:
+            return pd.DataFrame()
 
-    if not df_freq.empty:
-        df_freq["Texto"] = df_freq.apply(
-            lambda row: f"{row['Total Análises']:,}".replace(",", "."),
-            axis=1
-        )
+        lot_codes = [lot.get('code') for lot in lots if lot.get('code')]
 
-        fig_freq = px.bar(
-            df_freq,
-            x="Substância",
-            y="Total Análises",
-            text="Texto",
-            color="Taxa Positividade (%)",
-            color_continuous_scale=["#00CED1", "#1A1A2E"]
-        )
+        # Pipeline de agregação com estado
+        pipeline = [
+            {"$match": {"_lot": {"$in": lot_codes}}},
+            {"$unwind": "$samples"},
+            {"$match": {"samples.positive": True}},
+            {"$unwind": "$samples._compound"},
+            {"$match": {"samples._compound.positive": True}},
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "samples._compound._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
+            {"$unwind": "$compoundInfo"},
+            {
+                "$lookup": {
+                    "from": "chainofcustodies",
+                    "localField": "samples._sample",
+                    "foreignField": "sample.code",
+                    "as": "chainInfo"
+                }
+            },
+            {"$unwind": {"path": "$chainInfo", "preserveNullAndEmptyArrays": True}},
+            {
+                "$lookup": {
+                    "from": "gatherings",
+                    "localField": "chainInfo._id",
+                    "foreignField": "_chainOfCustody",
+                    "as": "gatheringInfo"
+                }
+            },
+            {"$unwind": {"path": "$gatheringInfo", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "substancia": "$compoundInfo.name",
+                    "sexo": "$chainInfo.donor.gender",
+                    "birthDate": "$chainInfo.donor.birthDate",
+                    "estado": "$chainInfo.donor.address.state.code",
+                    "purposeType": "$gatheringInfo.purpose.type",
+                    "purposeSubType": "$gatheringInfo.purpose.subType"
+                }
+            }
+        ]
 
-        fig_freq.update_traces(textposition="outside", textfont_size=9)
-        fig_freq.update_layout(
-            height=450,
-            margin=dict(t=30, b=100, l=50, r=50),
-            xaxis_title="",
-            yaxis_title="Total de Análises",
-            xaxis_tickangle=-45,
-            coloraxis_showscale=True,
-            coloraxis_colorbar_title="Taxa (%)"
-        )
+        results_collection = db["results"]
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
 
-        st.plotly_chart(fig_freq, use_container_width=True, key="chart_freq_substancias")
+        if not results:
+            return pd.DataFrame()
 
-    st.markdown("---")
+        df = pd.DataFrame(results)
 
-    # Tabela completa
-    st.subheader("📋 Tabela Completa")
+        # Calcular faixa etária
+        hoje = datetime.now()
 
-    st.dataframe(
-        df_stats.style.format({
-            "Total Análises": "{:,.0f}",
-            "Positivos": "{:,.0f}",
-            "Negativos": "{:,.0f}",
-            "Taxa Positividade (%)": "{:.2f}%"
-        }),
-        use_container_width=True,
-        hide_index=True,
-        height=400
-    )
+        def calcular_faixa_etaria(birth_date):
+            if pd.isna(birth_date) or birth_date is None:
+                return "N/A"
+            try:
+                idade = (hoje - birth_date).days // 365
+                if idade < 18:
+                    return "< 18"
+                elif idade <= 24:
+                    return "18-24"
+                elif idade <= 29:
+                    return "25-29"
+                elif idade <= 34:
+                    return "30-34"
+                elif idade <= 39:
+                    return "35-39"
+                elif idade <= 44:
+                    return "40-44"
+                elif idade <= 49:
+                    return "45-49"
+                elif idade <= 54:
+                    return "50-54"
+                elif idade <= 59:
+                    return "55-59"
+                else:
+                    return "60+"
+            except:
+                return "N/A"
 
-    # Download
-    csv = df_stats.to_csv(index=False, encoding='utf-8-sig')
-    st.download_button(
-        "⬇️ Download CSV",
-        csv,
-        "substancias_estatisticas.csv",
-        "text/csv",
-        use_container_width=False
-    )
+        df["faixa_etaria"] = df["birthDate"].apply(calcular_faixa_etaria)
+
+        # Mapear sexo
+        sexo_map = {"m": "Masculino", "f": "Feminino"}
+        df["sexo"] = df["sexo"].map(sexo_map).fillna("N/A")
+
+        # Preencher valores nulos
+        df["purposeType"] = df["purposeType"].fillna("N/A")
+        df["purposeSubType"] = df["purposeSubType"].fillna("")
+        df["estado"] = df["estado"].fillna("N/A")
+
+        # Remover coluna birthDate (não precisa mais)
+        df = df.drop(columns=["birthDate", "_id"], errors="ignore")
+
+        set_cached_data("demographic_raw", cache_key, df)
+        return df
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados demográficos: {e}")
+        return pd.DataFrame()
+
+
+def get_demographic_profile_by_substance(laboratory_id: str = None, month: int = None, analysis_type: str = "all") -> dict:
+    """
+    Busca o perfil demográfico mais comum para cada substância positiva.
+    Retorna dict {substância: {sexo, faixa_etaria, tipo_exame, subtipo, quantidade}}
+    """
+    selected_start, selected_end = get_selected_period()
+    cache_key = generate_cache_key("demographic_profile", laboratory_id, month, analysis_type, selected_start.isoformat(), selected_end.isoformat())
+    cached = get_cached_data("demographic_profile", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        client = get_mongo_client()
+        db = client["ctox"]
+
+        # Período
+        if month:
+            year = datetime.now().year
+            start_date = datetime(year, month, 1)
+            if month == 12:
+                end_date = datetime(year, 12, 31, 23, 59, 59)
+            else:
+                end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
+        else:
+            start_date = selected_start
+            end_date = selected_end
+
+        # Tipos de análise
+        if analysis_type == "all":
+            analysis_types = ["screening", "confirmatory", "confirmatoryTHC"]
+        else:
+            analysis_types = [analysis_type]
+
+        # Buscar lotes do período
+        lots_collection = db["lots"]
+        lots = list(lots_collection.find(
+            {
+                "analysisType": {"$in": analysis_types},
+                "createdAt": {"$gte": start_date, "$lte": end_date}
+            },
+            {"code": 1}
+        ))
+
+        if not lots:
+            return {}
+
+        lot_codes = [lot.get('code') for lot in lots if lot.get('code')]
+
+        # Pipeline de agregação
+        pipeline = [
+            # Filtrar pelos lotes do período
+            {"$match": {"_lot": {"$in": lot_codes}}},
+
+            # Desaninhar samples
+            {"$unwind": "$samples"},
+
+            # Filtrar apenas amostras positivas
+            {"$match": {"samples.positive": True}},
+
+            # Desaninhar compounds
+            {"$unwind": "$samples._compound"},
+
+            # Filtrar apenas compounds positivos
+            {"$match": {"samples._compound.positive": True}},
+
+            # Lookup para nome do compound
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "samples._compound._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
+            {"$unwind": "$compoundInfo"},
+
+            # Lookup para chainofcustodies (dados do doador)
+            {
+                "$lookup": {
+                    "from": "chainofcustodies",
+                    "localField": "samples._sample",
+                    "foreignField": "sample.code",
+                    "as": "chainInfo"
+                }
+            },
+            {"$unwind": {"path": "$chainInfo", "preserveNullAndEmptyArrays": True}},
+
+            # Lookup para gatherings (finalidade)
+            {
+                "$lookup": {
+                    "from": "gatherings",
+                    "localField": "chainInfo._id",
+                    "foreignField": "_chainOfCustody",
+                    "as": "gatheringInfo"
+                }
+            },
+            {"$unwind": {"path": "$gatheringInfo", "preserveNullAndEmptyArrays": True}},
+
+            # Projetar campos necessários
+            {
+                "$project": {
+                    "substancia": "$compoundInfo.name",
+                    "sexo": "$chainInfo.donor.gender",
+                    "birthDate": "$chainInfo.donor.birthDate",
+                    "purposeType": "$gatheringInfo.purpose.type",
+                    "purposeSubType": "$gatheringInfo.purpose.subType"
+                }
+            }
+        ]
+
+        results_collection = db["results"]
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
+
+        if not results:
+            return {}
+
+        # Processar resultados
+        df = pd.DataFrame(results)
+
+        # Calcular idade e faixa etária
+        hoje = datetime.now()
+
+        def calcular_faixa_etaria(birth_date):
+            if pd.isna(birth_date) or birth_date is None:
+                return "N/A"
+            try:
+                idade = (hoje - birth_date).days // 365
+                if idade < 18:
+                    return "< 18"
+                elif idade <= 24:
+                    return "18-24"
+                elif idade <= 29:
+                    return "25-29"
+                elif idade <= 34:
+                    return "30-34"
+                elif idade <= 39:
+                    return "35-39"
+                elif idade <= 44:
+                    return "40-44"
+                elif idade <= 49:
+                    return "45-49"
+                elif idade <= 54:
+                    return "50-54"
+                elif idade <= 59:
+                    return "55-59"
+                else:
+                    return "60+"
+            except:
+                return "N/A"
+
+        df["faixa_etaria"] = df["birthDate"].apply(calcular_faixa_etaria)
+
+        # Mapear sexo
+        sexo_map = {"m": "Masculino", "f": "Feminino"}
+        df["sexo"] = df["sexo"].map(sexo_map).fillna("N/A")
+
+        # Preencher valores nulos
+        df["purposeType"] = df["purposeType"].fillna("N/A")
+        df["purposeSubType"] = df["purposeSubType"].fillna("")
+
+        # Agrupar e contar
+        grouped = df.groupby(
+            ["substancia", "sexo", "faixa_etaria", "purposeType", "purposeSubType"]
+        ).size().reset_index(name="quantidade")
+
+        # Para cada substância, pegar o perfil mais comum
+        result = {}
+        for substancia in grouped["substancia"].unique():
+            df_sub = grouped[grouped["substancia"] == substancia]
+            top = df_sub.nlargest(1, "quantidade").iloc[0]
+            result[substancia] = {
+                "sexo": top["sexo"],
+                "faixa_etaria": top["faixa_etaria"],
+                "tipo_exame": top["purposeType"],
+                "subtipo": top["purposeSubType"],
+                "quantidade": int(top["quantidade"])
+            }
+
+        # Ordenar por quantidade total de positivos
+        result = dict(sorted(result.items(), key=lambda x: x[1]["quantidade"], reverse=True))
+
+        set_cached_data("demographic_profile", cache_key, result)
+        return result
+
+    except Exception as e:
+        st.error(f"Erro ao buscar perfil demográfico: {e}")
+        return {}
+
+
+def get_demographic_table_data(laboratory_id: str = None, month: int = None, analysis_type: str = "all") -> pd.DataFrame:
+    """
+    Retorna tabela completa com dados demográficos por substância.
+    """
+    selected_start, selected_end = get_selected_period()
+    cache_key = generate_cache_key("demographic_table", laboratory_id, month, analysis_type, selected_start.isoformat(), selected_end.isoformat())
+    cached = get_cached_data("demographic_table", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        client = get_mongo_client()
+        db = client["ctox"]
+
+        # Período
+        if month:
+            year = datetime.now().year
+            start_date = datetime(year, month, 1)
+            if month == 12:
+                end_date = datetime(year, 12, 31, 23, 59, 59)
+            else:
+                end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
+        else:
+            start_date = selected_start
+            end_date = selected_end
+
+        # Tipos de análise
+        if analysis_type == "all":
+            analysis_types = ["screening", "confirmatory", "confirmatoryTHC"]
+        else:
+            analysis_types = [analysis_type]
+
+        # Buscar lotes do período
+        lots_collection = db["lots"]
+        lots = list(lots_collection.find(
+            {
+                "analysisType": {"$in": analysis_types},
+                "createdAt": {"$gte": start_date, "$lte": end_date}
+            },
+            {"code": 1}
+        ))
+
+        if not lots:
+            return pd.DataFrame()
+
+        lot_codes = [lot.get('code') for lot in lots if lot.get('code')]
+
+        # Pipeline de agregação
+        pipeline = [
+            {"$match": {"_lot": {"$in": lot_codes}}},
+            {"$unwind": "$samples"},
+            {"$match": {"samples.positive": True}},
+            {"$unwind": "$samples._compound"},
+            {"$match": {"samples._compound.positive": True}},
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "samples._compound._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
+            {"$unwind": "$compoundInfo"},
+            {
+                "$lookup": {
+                    "from": "chainofcustodies",
+                    "localField": "samples._sample",
+                    "foreignField": "sample.code",
+                    "as": "chainInfo"
+                }
+            },
+            {"$unwind": {"path": "$chainInfo", "preserveNullAndEmptyArrays": True}},
+            {
+                "$lookup": {
+                    "from": "gatherings",
+                    "localField": "chainInfo._id",
+                    "foreignField": "_chainOfCustody",
+                    "as": "gatheringInfo"
+                }
+            },
+            {"$unwind": {"path": "$gatheringInfo", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "substancia": "$compoundInfo.name",
+                    "sexo": "$chainInfo.donor.gender",
+                    "birthDate": "$chainInfo.donor.birthDate",
+                    "purposeType": "$gatheringInfo.purpose.type",
+                    "purposeSubType": "$gatheringInfo.purpose.subType"
+                }
+            }
+        ]
+
+        results_collection = db["results"]
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
+
+        if not results:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(results)
+
+        # Calcular faixa etária
+        hoje = datetime.now()
+
+        def calcular_faixa_etaria(birth_date):
+            if pd.isna(birth_date) or birth_date is None:
+                return "N/A"
+            try:
+                idade = (hoje - birth_date).days // 365
+                if idade < 18:
+                    return "< 18"
+                elif idade <= 24:
+                    return "18-24"
+                elif idade <= 29:
+                    return "25-29"
+                elif idade <= 34:
+                    return "30-34"
+                elif idade <= 39:
+                    return "35-39"
+                elif idade <= 44:
+                    return "40-44"
+                elif idade <= 49:
+                    return "45-49"
+                elif idade <= 54:
+                    return "50-54"
+                elif idade <= 59:
+                    return "55-59"
+                else:
+                    return "60+"
+            except:
+                return "N/A"
+
+        df["faixa_etaria"] = df["birthDate"].apply(calcular_faixa_etaria)
+
+        # Mapear valores
+        sexo_map = {"m": "Masculino", "f": "Feminino"}
+        df["sexo"] = df["sexo"].map(sexo_map).fillna("N/A")
+
+        tipos_map = {
+            "cnh": "CNH",
+            "admissional": "Admissional",
+            "periodico": "Periódico",
+            "demissional": "Demissional"
+        }
+        df["purposeType"] = df["purposeType"].map(tipos_map).fillna(df["purposeType"]).fillna("N/A")
+
+        subtipos_map = {
+            "firstCnh": "Primeira Habilitação",
+            "renovation": "Renovação",
+            "categoryChange": "Mudança de Categoria"
+        }
+        df["purposeSubType"] = df["purposeSubType"].map(subtipos_map).fillna(df["purposeSubType"]).fillna("")
+
+        # Agrupar e contar
+        grouped = df.groupby(
+            ["substancia", "sexo", "faixa_etaria", "purposeType", "purposeSubType"]
+        ).size().reset_index(name="quantidade")
+
+        # Renomear colunas
+        grouped.columns = ["Substância", "Sexo", "Faixa Etária", "Tipo Exame", "Subtipo", "Quantidade"]
+
+        # Ordenar
+        grouped = grouped.sort_values(["Substância", "Quantidade"], ascending=[True, False])
+
+        set_cached_data("demographic_table", cache_key, grouped)
+        return grouped
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados demográficos: {e}")
+        return pd.DataFrame()
 
 
 def get_substance_statistics(laboratory_id: str = None, month: int = None, analysis_type: str = "all") -> dict:
@@ -3793,7 +4512,7 @@ def render_mapa():
     st.markdown("---")
 
     # Filtros
-    col_f1, col_f2 = st.columns(2)
+    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
 
     with col_f1:
         meses = {
@@ -3809,10 +4528,33 @@ def render_mapa():
         selected_analysis = st.selectbox("Tipo de Análise", options=list(analysis_options.keys()), index=0, key="mapa_analysis")
         analysis_type = analysis_options[selected_analysis]
 
+    with col_f3:
+        finalidades = {
+            "Todas": None,
+            "CLT": "clt",
+            "CLT + CNH": "cltCnh",
+            "Concurso Público": "civilService",
+        }
+        selected_finalidade_name = st.selectbox("Finalidade", options=list(finalidades.keys()), index=0, key="mapa_finalidade")
+        selected_purpose = finalidades[selected_finalidade_name]
+
+    with col_f4:
+        labs_by_cnpj = get_laboratories_by_cnpj()
+        cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
+        selected_cnpj = st.selectbox("CNPJ Laboratório", options=cnpj_options, index=0, key="mapa_cnpj")
+
+        if selected_cnpj and selected_cnpj != "Todos":
+            lab_info = labs_by_cnpj.get(selected_cnpj, {})
+            selected_lab_id = lab_info.get("id")
+        else:
+            selected_lab_id = None
+
     st.markdown("---")
 
-    with st.spinner("Carregando dados geográficos..."):
-        geo_data = get_geographic_data(selected_month, analysis_type)
+    geo_data = loading_single(
+        get_geographic_data, "Carregando dados geográficos...",
+        selected_month, analysis_type, selected_lab_id, selected_purpose
+    )
 
     if not geo_data:
         st.warning("Nenhum dado geográfico encontrado")
@@ -3853,6 +4595,115 @@ def render_mapa():
 
     st.markdown("---")
 
+    # Mapa Choropleth do Brasil
+    st.subheader("🗺️ Distribuição Geográfica - Taxa de Positividade por Estado")
+
+    # Mapeamento de nomes completos para siglas
+    nome_para_sigla = {
+        "Acre": "AC", "Alagoas": "AL", "Amapá": "AP", "Amazonas": "AM",
+        "Bahia": "BA", "Ceará": "CE", "Distrito Federal": "DF", "Espírito Santo": "ES",
+        "Goiás": "GO", "Maranhão": "MA", "Mato Grosso": "MT", "Mato Grosso do Sul": "MS",
+        "Minas Gerais": "MG", "Pará": "PA", "Paraíba": "PB", "Paraná": "PR",
+        "Pernambuco": "PE", "Piauí": "PI", "Rio de Janeiro": "RJ", "Rio Grande do Norte": "RN",
+        "Rio Grande do Sul": "RS", "Rondônia": "RO", "Roraima": "RR", "Santa Catarina": "SC",
+        "São Paulo": "SP", "Sergipe": "SE", "Tocantins": "TO"
+    }
+
+    sigla_para_nome = {v: k for k, v in nome_para_sigla.items()}
+
+    if not df_estado.empty:
+        # Preparar dados para o mapa
+        mapa_data = []
+        for _, row in df_estado.iterrows():
+            estado = row["Estado"]
+            # Converter nome completo para sigla se necessário
+            sigla = nome_para_sigla.get(estado, estado)
+            nome = sigla_para_nome.get(sigla, estado)
+            mapa_data.append({
+                "UF": sigla,
+                "Estado": nome,
+                "Total": row["Total"],
+                "Positivos": row["Positivos"],
+                "Taxa": row["Taxa (%)"]
+            })
+
+        if mapa_data:
+            df_mapa = pd.DataFrame(mapa_data)
+
+            # Usar choropleth com GeoJSON do Brasil
+            geojson_url = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
+
+            try:
+                import requests
+                response = requests.get(geojson_url, timeout=10)
+                brazil_geojson = response.json()
+
+                # Criar mapa choropleth
+                fig_mapa = px.choropleth(
+                    df_mapa,
+                    geojson=brazil_geojson,
+                    locations="UF",
+                    featureidkey="properties.sigla",
+                    color="Taxa",
+                    color_continuous_scale=[
+                        [0, "#00CED1"],      # Verde/Azul - baixa taxa
+                        [0.5, "#FFD700"],    # Amarelo - média taxa
+                        [1, "#FF4444"]       # Vermelho - alta taxa
+                    ],
+                    hover_name="Estado",
+                    hover_data={
+                        "UF": False,
+                        "Total": ":,",
+                        "Positivos": ":,",
+                        "Taxa": ":.2f"
+                    },
+                    labels={"Taxa": "Taxa (%)", "Total": "Total Amostras", "Positivos": "Positivos"}
+                )
+
+                fig_mapa.update_geos(
+                    fitbounds="locations",
+                    visible=False,
+                    bgcolor="rgba(0,0,0,0)"
+                )
+
+                fig_mapa.update_layout(
+                    height=550,
+                    margin=dict(t=10, b=10, l=10, r=10),
+                    coloraxis_colorbar=dict(
+                        title="Taxa (%)",
+                        ticksuffix="%",
+                        len=0.7,
+                        thickness=15,
+                        x=0.95
+                    ),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    geo=dict(
+                        bgcolor="rgba(0,0,0,0)",
+                        showframe=False
+                    )
+                )
+
+                # Adicionar anotações com siglas dos estados
+                fig_mapa.update_traces(
+                    marker_line_color="white",
+                    marker_line_width=1
+                )
+
+                st.plotly_chart(fig_mapa, use_container_width=True, key="chart_mapa_brasil")
+
+                # Legenda explicativa
+                st.caption("🟢 Verde/Azul = Baixa taxa de positividade | 🟡 Amarelo = Taxa média | 🔴 Vermelho = Alta taxa de positividade")
+
+            except Exception as e:
+                st.warning(f"Não foi possível carregar o mapa: {e}")
+                st.info("Exibindo dados em formato de tabela.")
+        else:
+            st.info("Nenhum dado de estado encontrado para exibir no mapa")
+    else:
+        st.info("Nenhum dado de estado encontrado")
+
+    st.markdown("---")
+
     # Gráficos
     col_g1, col_g2 = st.columns(2)
 
@@ -3864,8 +4715,11 @@ def render_mapa():
                 lambda row: f"{row['Total']:,} ({row['Taxa (%)']:.1f}%)".replace(",", "."), axis=1
             )
 
+            df_top_estado = df_estado.head(10).copy()
+            max_estado = df_top_estado["Total"].max()
+
             fig_estado = px.bar(
-                df_estado.head(15),
+                df_top_estado,
                 y="Estado",
                 x="Total",
                 orientation="h",
@@ -3874,28 +4728,36 @@ def render_mapa():
                 color_continuous_scale=["#00CED1", "#FF6B6B"]
             )
 
-            fig_estado.update_traces(textposition="outside", textfont_size=9)
+            fig_estado.update_traces(
+                textposition="outside",
+                textfont_size=10,
+                cliponaxis=False
+            )
             fig_estado.update_layout(
-                height=500,
-                margin=dict(t=30, b=30, l=50, r=80),
-                xaxis_title="Total de Amostras",
+                height=400,
+                margin=dict(t=30, b=30, l=80, r=150),
+                xaxis_title="",
                 yaxis_title="",
                 yaxis=dict(autorange="reversed"),
+                xaxis=dict(range=[0, max_estado * 1.35], showticklabels=False, showgrid=False),
                 coloraxis_showscale=False
             )
 
             st.plotly_chart(fig_estado, use_container_width=True, key="chart_mapa_estado")
 
     with col_g2:
-        st.subheader("🏙️ Top 15 Cidades")
+        st.subheader("🏙️ Top 5 Cidades")
 
         if not df_cidade.empty:
             df_cidade["Texto"] = df_cidade.apply(
-                lambda row: f"{row['Total']:,}".replace(",", "."), axis=1
+                lambda row: f"{row['Total']:,} ({row['Taxa (%)']:.1f}%)".replace(",", "."), axis=1
             )
 
+            df_top_cidade = df_cidade.head(5).copy()
+            max_cidade = df_top_cidade["Total"].max()
+
             fig_cidade = px.bar(
-                df_cidade.head(15),
+                df_top_cidade,
                 y="Cidade",
                 x="Total",
                 orientation="h",
@@ -3904,13 +4766,18 @@ def render_mapa():
                 color_continuous_scale=["#00CED1", "#FF6B6B"]
             )
 
-            fig_cidade.update_traces(textposition="outside", textfont_size=9)
+            fig_cidade.update_traces(
+                textposition="outside",
+                textfont_size=10,
+                cliponaxis=False
+            )
             fig_cidade.update_layout(
-                height=500,
-                margin=dict(t=30, b=30, l=120, r=50),
-                xaxis_title="Total de Amostras",
+                height=400,
+                margin=dict(t=30, b=30, l=150, r=150),
+                xaxis_title="",
                 yaxis_title="",
                 yaxis=dict(autorange="reversed"),
+                xaxis=dict(range=[0, max_cidade * 1.35], showticklabels=False, showgrid=False),
                 coloraxis_showscale=False
             )
 
@@ -3923,20 +4790,20 @@ def render_mapa():
 
     with col_t1:
         st.subheader("📋 Dados por Estado")
-        st.dataframe(df_estado, use_container_width=True, hide_index=True, height=300)
+        st.dataframe(df_estado[["Estado", "Total", "Positivos", "Taxa (%)"]], use_container_width=True, hide_index=True, height=300)
 
     with col_t2:
         st.subheader("📋 Dados por Cidade")
-        st.dataframe(df_cidade, use_container_width=True, hide_index=True, height=300)
+        st.dataframe(df_cidade[["Cidade", "Estado", "Total", "Positivos", "Taxa (%)"]], use_container_width=True, hide_index=True, height=300)
 
 
-def get_geographic_data(month: int = None, analysis_type: str = "all") -> dict:
+def get_geographic_data(month: int = None, analysis_type: str = "all", laboratory_id: str = None, purpose_type: str = None) -> dict:
     """
     Busca dados geográficos por estado e cidade.
     """
     # Usar período selecionado na sidebar para cache key
     selected_start, selected_end = get_selected_period()
-    cache_key = generate_cache_key("geographic", month, analysis_type, selected_start.isoformat(), selected_end.isoformat())
+    cache_key = generate_cache_key("geographic", month, analysis_type, laboratory_id, purpose_type, selected_start.isoformat(), selected_end.isoformat())
     cached = get_cached_data("geographic_data", cache_key)
     if cached is not None:
         return cached
@@ -3976,9 +4843,16 @@ def get_geographic_data(month: int = None, analysis_type: str = "all") -> dict:
         results_collection = get_collection("results")
         gatherings_collection = get_collection("gatherings")
 
+        # Query para gatherings
+        gatherings_query = {"createdAt": {"$gte": start_date, "$lte": end_date}}
+        if laboratory_id:
+            gatherings_query["_laboratory"] = ObjectId(laboratory_id)
+        if purpose_type:
+            gatherings_query["purpose.type"] = purpose_type
+
         # Buscar gatherings para mapear chainOfCustody -> laboratory
         gatherings = list(gatherings_collection.find(
-            {"createdAt": {"$gte": start_date, "$lte": end_date}},
+            gatherings_query,
             {"_chainOfCustody": 1, "_laboratory": 1}
         ))
 
@@ -4125,14 +4999,16 @@ def render_temporal():
 
     st.markdown("---")
 
-    with st.spinner("Carregando dados temporais..."):
-        if view_type == "monthly":
-            temporal_data = get_monthly_positivity_data(
-                laboratory_ids=selected_lab_id,
-                analysis_type=analysis_type
-            )
-        else:
-            temporal_data = get_weekly_data(selected_lab_id, analysis_type)
+    if view_type == "monthly":
+        temporal_data = loading_single(
+            get_monthly_positivity_data, "Carregando dados temporais...",
+            laboratory_ids=selected_lab_id, analysis_type=analysis_type
+        )
+    else:
+        temporal_data = loading_single(
+            get_weekly_data, "Carregando dados temporais...",
+            selected_lab_id, analysis_type
+        )
 
     if not temporal_data:
         st.warning("Nenhum dado encontrado")
@@ -4409,8 +5285,7 @@ def render_tabela_detalhada():
 
     st.markdown("---")
 
-    with st.spinner("Carregando dados..."):
-        df = get_substance_data()
+    df = loading_single(get_substance_data, "Carregando tabela detalhada...")
 
     if df.empty:
         st.warning("⚠️ Nenhum dado encontrado")
@@ -4548,8 +5423,7 @@ def render_auditoria():
 
     st.markdown("---")
 
-    with st.spinner("Analisando dados..."):
-        anomalias = detect_anomalies()
+    anomalias = loading_single(detect_anomalies, "Analisando dados...")
 
     if not anomalias:
         st.success("✅ Nenhuma anomalia detectada!")
@@ -4787,8 +5661,7 @@ def render_rede():
     st.info(f"📅 **Período:** {periodo_inicio.strftime('%d/%m/%Y')} a {periodo_fim.strftime('%d/%m/%Y')} *(altere na sidebar)*")
 
     # Buscar redes identificadas por CNPJ
-    with st.spinner("Identificando redes por CNPJ..."):
-        networks = get_networks_by_cnpj()
+    networks = loading_single(get_networks_by_cnpj, "Identificando redes por CNPJ...")
 
     if not networks:
         st.warning("Nenhuma rede identificada. Redes são identificadas quando há mais de um laboratório com os mesmos 8 primeiros dígitos do CNPJ.")
@@ -4820,8 +5693,10 @@ def render_rede():
     st.markdown("---")
 
     # Buscar dados de comparação
-    with st.spinner("Carregando dados das filiais..."):
-        comparison_data = get_network_comparison_data(labs_da_rede)
+    comparison_data = loading_single(
+        get_network_comparison_data, "Carregando dados das filiais...",
+        labs_da_rede
+    )
 
     if not comparison_data:
         st.warning("Nenhum dado encontrado para as filiais desta rede no período selecionado.")
