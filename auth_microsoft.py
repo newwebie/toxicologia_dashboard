@@ -136,7 +136,7 @@ LOGIN_PAGE_CSS = f"""
     padding: 1rem 1.25rem;
     border-radius: 14px;
     background: linear-gradient(135deg, {PRIMARY_COLOR}, {SECONDARY_COLOR});
-    color: #ffffff;
+    color: #ffffff !important;
     font-weight: 700;
     letter-spacing: 0.01em;
     text-decoration: none;
@@ -144,14 +144,28 @@ LOGIN_PAGE_CSS = f"""
     transition: transform 0.25s ease, box-shadow 0.25s ease;
     box-shadow: 0 18px 36px rgba(0, 102, 204, 0.28);
 }}
+.login-button span {{
+    color: #ffffff !important;
+}}
 .login-button:hover {{
     transform: translateY(-2px);
     box-shadow: 0 24px 46px rgba(0, 102, 204, 0.33);
     text-decoration: none;
+    color: #ffffff !important;
+}}
+.login-button:hover span {{
+    color: #ffffff !important;
+}}
+.login-button:visited {{
+    color: #ffffff !important;
+}}
+.login-button:active {{
+    color: #ffffff !important;
 }}
 .login-button-icon {{
     font-size: 1.25rem;
     line-height: 1;
+    color: #ffffff !important;
 }}
 .login-meta {{
     margin-top: 1.75rem;

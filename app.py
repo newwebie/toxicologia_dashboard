@@ -1182,11 +1182,13 @@ def get_substance_data() -> pd.DataFrame:
         df_meta = df_long[['_lot', '_sample', 'samplePositive']].drop_duplicates()
 
         # Pivotar os compounds
+        # Usar 'max' como aggfunc para que se houver qualquer True, o resultado seja True
+        # (True > False na comparação, então max(True, False) = True)
         df_pivot = df_long.pivot_table(
             index='_sample',
             columns='compoundName',
             values='compoundPositive',
-            aggfunc='first'  # Caso haja duplicatas, pegar o primeiro
+            aggfunc='max'  # Se houver qualquer positivo, considera positivo
         ).reset_index()
 
         # Converter True/False para "Positivo"/"Negativo"
@@ -1223,18 +1225,28 @@ def get_sample_concentration_data(sample_code: str) -> dict:
     """
     Busca os dados de concentração de uma amostra específica.
     Retorna dict {compound_name: {"concentration": float, "positive": bool}}
+
+    Estrutura do MongoDB (collection results):
+    - samples: array de amostras
+    - samples._sample: código da amostra (string ou número)
+    - samples._compound: array de compostos
+    - samples._compound._id: ObjectId referenciando collection compounds
+    - samples._compound.positive: bool indicando se o composto é positivo
+    - samples._compound.concentration: float com a concentração
     """
     try:
         client = get_mongo_client()
         db = client["ctox"]
         results_collection = db["results"]
 
-        # Converter para ObjectId se possível (o _sample pode ser ObjectId no MongoDB)
-        sample_match_values = [sample_code]
+        # O _sample pode ser string ou número no MongoDB, tentar ambos
+        sample_code_clean = str(sample_code).strip()
+        sample_match_values = [sample_code_clean]
         try:
-            sample_match_values.append(ObjectId(sample_code))
+            # Tentar como número inteiro
+            sample_match_values.append(int(sample_code_clean))
         except:
-            pass  # Não é um ObjectId válido, usar só string
+            pass
 
         # Buscar o resultado que contém essa amostra
         pipeline = [
@@ -1249,7 +1261,7 @@ def get_sample_concentration_data(sample_code: str) -> dict:
                     "as": "compoundInfo"
                 }
             },
-            {"$unwind": "$compoundInfo"},
+            {"$unwind": {"path": "$compoundInfo", "preserveNullAndEmptyArrays": True}},
             {
                 "$project": {
                     "compoundName": "$compoundInfo.name",
@@ -1354,6 +1366,181 @@ def get_average_concentrations() -> dict:
 
     except Exception as e:
         st.error(f"Erro ao buscar médias de concentração: {e}")
+        return {}
+
+
+def get_sample_laboratory(sample_code: str) -> dict:
+    """
+    Busca o laboratório vinculado a uma amostra.
+    Caminho: sample -> lot -> chainOfCustody -> gathering -> laboratory
+    Retorna dict com lab_id, lab_name, lab_city, lab_state
+    """
+    try:
+        client = get_mongo_client()
+        db = client["ctox"]
+
+        # O _sample pode ser string ou número
+        sample_code_clean = str(sample_code).strip()
+        sample_match_values = [sample_code_clean]
+        try:
+            sample_match_values.append(int(sample_code_clean))
+        except:
+            pass
+
+        # 1. Buscar o resultado que contém essa amostra para pegar o _lot
+        results_collection = db["results"]
+        result = results_collection.find_one(
+            {"samples._sample": {"$in": sample_match_values}},
+            {"_lot": 1}
+        )
+
+        if not result:
+            return {}
+
+        lot_code = result.get("_lot")
+        if not lot_code:
+            return {}
+
+        # 2. Buscar o lote para pegar o _chainOfCustody
+        lots_collection = db["lots"]
+        lot = lots_collection.find_one(
+            {"code": lot_code},
+            {"_chainOfCustody": 1}
+        )
+
+        if not lot:
+            return {}
+
+        chain_id = lot.get("_chainOfCustody")
+        if not chain_id:
+            return {}
+
+        # 3. Buscar o gathering para pegar o _laboratory
+        gatherings_collection = db["gatherings"]
+        gathering = gatherings_collection.find_one(
+            {"_chainOfCustody": chain_id},
+            {"_laboratory": 1}
+        )
+
+        if not gathering:
+            return {}
+
+        lab_id = gathering.get("_laboratory")
+        if not lab_id:
+            return {}
+
+        # 4. Buscar informações do laboratório
+        labs_map = get_laboratories_map()
+        lab_id_str = str(lab_id)
+
+        if lab_id_str in labs_map:
+            lab_name = labs_map[lab_id_str]
+        else:
+            lab_name = "Laboratório"
+
+        # Buscar mais detalhes do laboratório
+        labs_with_address = get_laboratories_with_address()
+        lab_details = next((lab for lab in labs_with_address if lab.get("id") == lab_id_str), {})
+
+        return {
+            "lab_id": lab_id_str,
+            "lab_name": lab_name,
+            "lab_city": lab_details.get("city", ""),
+            "lab_state": lab_details.get("state", "")
+        }
+
+    except Exception as e:
+        return {}
+
+
+def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
+    """
+    Busca a média de concentrações por substância de amostras POSITIVAS de um laboratório específico.
+    Retorna dict {compound_name: {"avg_concentration": float, "count": int}}
+    """
+    if not laboratory_id:
+        return {}
+
+    start_date, end_date = get_selected_period()
+
+    cache_key = generate_cache_key("avg_concentrations_lab", laboratory_id, start_date, end_date)
+    cached = get_cached_data("avg_concentrations_lab", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        client = get_mongo_client()
+        db = client["ctox"]
+        results_collection = db["results"]
+        lots_collection = db["lots"]
+        gatherings_collection = db["gatherings"]
+
+        # 1. Buscar gatherings do laboratório para pegar os chainOfCustody
+        lab_gatherings = list(gatherings_collection.find(
+            {"_laboratory": ObjectId(laboratory_id)},
+            {"_chainOfCustody": 1}
+        ))
+        chain_ids = [g.get("_chainOfCustody") for g in lab_gatherings if g.get("_chainOfCustody")]
+
+        if not chain_ids:
+            return {}
+
+        # 2. Buscar lotes do período que pertencem a essas chains
+        lots_period = list(lots_collection.find(
+            {
+                "createdAt": {"$gte": start_date, "$lte": end_date},
+                "_chainOfCustody": {"$in": chain_ids}
+            },
+            {"code": 1}
+        ))
+        lot_codes = [lot.get("code") for lot in lots_period if lot.get("code")]
+
+        if not lot_codes:
+            return {}
+
+        # 3. Pipeline para calcular média de concentração por substância (apenas positivos)
+        pipeline = [
+            {"$match": {"_lot": {"$in": lot_codes}}},
+            {"$unwind": "$samples"},
+            {"$unwind": "$samples._compound"},
+            {"$match": {"samples._compound.positive": True}},
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "samples._compound._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
+            {"$unwind": "$compoundInfo"},
+            {
+                "$group": {
+                    "_id": "$compoundInfo.name",
+                    "avg_concentration": {"$avg": "$samples._compound.concentration"},
+                    "max_concentration": {"$max": "$samples._compound.concentration"},
+                    "min_concentration": {"$min": "$samples._compound.concentration"},
+                    "count": {"$sum": 1}
+                }
+            }
+        ]
+
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
+
+        avg_data = {}
+        for r in results:
+            compound_name = r.get("_id", "")
+            if compound_name:
+                avg_data[compound_name] = {
+                    "avg_concentration": r.get("avg_concentration", 0),
+                    "max_concentration": r.get("max_concentration", 0),
+                    "min_concentration": r.get("min_concentration", 0),
+                    "count": r.get("count", 0)
+                }
+
+        set_cached_data("avg_concentrations_lab", cache_key, avg_data)
+        return avg_data
+
+    except Exception as e:
         return {}
 
 
@@ -5803,21 +5990,41 @@ def render_tabela_detalhada():
         with st.spinner("Carregando dados de concentração..."):
             # Buscar concentrações da amostra
             concentration_data = get_sample_concentration_data(amostra_code)
-            # Buscar médias do período
+            # Buscar médias gerais do período
             avg_data = get_average_concentrations()
+            # Buscar laboratório da amostra
+            lab_info = get_sample_laboratory(amostra_code)
+            # Buscar médias do laboratório específico
+            avg_data_lab = {}
+            if lab_info.get("lab_id"):
+                avg_data_lab = get_average_concentrations_by_lab(lab_info["lab_id"])
+
+        # Mostrar informação do laboratório
+        if lab_info.get("lab_name"):
+            lab_location = f"{lab_info.get('lab_city', '')}/{lab_info.get('lab_state', '')}" if lab_info.get('lab_city') else ""
+            st.info(f"🏢 **Laboratório:** {lab_info['lab_name']} {f'({lab_location})' if lab_location else ''}")
 
         if concentration_data:
             # Filtrar apenas substâncias positivas na amostra
-            positive_compounds = {k: v for k, v in concentration_data.items() if v.get("positive", False)}
+            # O campo positive pode ser True (bool) ou valor truthy
+            positive_compounds = {k: v for k, v in concentration_data.items() if v.get("positive") == True}
 
             if positive_compounds:
                 st.markdown("#### Substâncias Positivas Encontradas")
 
                 for compound_name, data in positive_compounds.items():
                     conc_amostra = data.get("concentration", 0) or 0
+                    # Média geral
                     avg_info = avg_data.get(compound_name, {})
-                    conc_media = avg_info.get("avg_concentration", 0) or 0
-                    conc_max = avg_info.get("max_concentration", 0) or 0
+                    conc_media_geral = avg_info.get("avg_concentration", 0) or 0
+                    # Média do laboratório
+                    avg_info_lab = avg_data_lab.get(compound_name, {})
+                    conc_media_lab = avg_info_lab.get("avg_concentration", 0) or 0
+                    # Máximo para escala do gráfico
+                    conc_max = max(
+                        avg_info.get("max_concentration", 0) or 0,
+                        avg_info_lab.get("max_concentration", 0) or 0
+                    )
 
                     # Card com informações da droga
                     col_info, col_chart = st.columns([1, 2])
@@ -5835,8 +6042,11 @@ def render_tabela_detalhada():
                         """, unsafe_allow_html=True)
 
                     with col_chart:
-                        # Gráfico de barras comparativo
-                        if conc_media > 0:
+                        # Gráfico de barras comparativo com 3 barras
+                        has_media_geral = conc_media_geral > 0
+                        has_media_lab = conc_media_lab > 0
+
+                        if has_media_geral or has_media_lab:
                             fig_comp = go.Figure()
 
                             # Barra da amostra
@@ -5846,32 +6056,46 @@ def render_tabela_detalhada():
                                 x=[conc_amostra],
                                 orientation='h',
                                 marker_color='#FFD700',
-                                text=f'{conc_amostra:.4f} ng/mg',
+                                text=f'{conc_amostra:.4f}',
                                 textposition='outside',
-                                textfont=dict(size=11)
+                                textfont=dict(size=10)
                             ))
 
-                            # Barra da média
-                            fig_comp.add_trace(go.Bar(
-                                name='Quantidade média',
-                                y=[''],
-                                x=[conc_media],
-                                orientation='h',
-                                marker_color='#4169E1',
-                                text=f'{conc_media:.4f} ng/mg',
-                                textposition='outside',
-                                textfont=dict(size=11)
-                            ))
+                            # Barra da média do laboratório
+                            if has_media_lab:
+                                fig_comp.add_trace(go.Bar(
+                                    name='Média do laboratório',
+                                    y=[''],
+                                    x=[conc_media_lab],
+                                    orientation='h',
+                                    marker_color='#00CED1',
+                                    text=f'{conc_media_lab:.4f}',
+                                    textposition='outside',
+                                    textfont=dict(size=10)
+                                ))
 
-                            max_val = max(conc_amostra, conc_media, conc_max) * 1.3
+                            # Barra da média geral
+                            if has_media_geral:
+                                fig_comp.add_trace(go.Bar(
+                                    name='Média geral',
+                                    y=[''],
+                                    x=[conc_media_geral],
+                                    orientation='h',
+                                    marker_color='#4169E1',
+                                    text=f'{conc_media_geral:.4f}',
+                                    textposition='outside',
+                                    textfont=dict(size=10)
+                                ))
+
+                            max_val = max(conc_amostra, conc_media_geral, conc_media_lab, conc_max) * 1.3
                             fig_comp.update_layout(
-                                height=120,
+                                height=140,
                                 margin=dict(t=10, b=10, l=10, r=80),
                                 plot_bgcolor='rgba(0,0,0,0)',
                                 paper_bgcolor='rgba(0,0,0,0)',
                                 barmode='group',
                                 showlegend=True,
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5, font=dict(size=10)),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5, font=dict(size=9)),
                                 xaxis=dict(range=[0, max_val], showticklabels=False, showgrid=False),
                                 yaxis=dict(showticklabels=False)
                             )
@@ -5880,16 +6104,19 @@ def render_tabela_detalhada():
                         else:
                             st.info(f"Não há dados de média para {compound_name} no período selecionado.")
 
-                        # Indicador de padrão de consumo
-                        if conc_media > 0:
-                            if conc_amostra > conc_media * 1.5:
-                                padrao_texto = "A quantidade de droga encontrada nesta amostra está **ACIMA** do padrão médio de consumo."
+                        # Indicador de padrão de consumo (prioriza média do laboratório)
+                        media_referencia = conc_media_lab if conc_media_lab > 0 else conc_media_geral
+                        tipo_media = "do laboratório" if conc_media_lab > 0 else "geral"
+
+                        if media_referencia > 0:
+                            if conc_amostra > media_referencia * 1.5:
+                                padrao_texto = f"A quantidade encontrada está **ACIMA** do padrão médio {tipo_media} de consumo."
                                 padrao_cor = "#FF6B6B"
-                            elif conc_amostra < conc_media * 0.5:
-                                padrao_texto = "A quantidade de droga encontrada nesta amostra está **ABAIXO** do padrão médio de consumo."
+                            elif conc_amostra < media_referencia * 0.5:
+                                padrao_texto = f"A quantidade encontrada está **ABAIXO** do padrão médio {tipo_media} de consumo."
                                 padrao_cor = "#4CAF50"
                             else:
-                                padrao_texto = "A quantidade de droga encontrada nesta amostra está **DENTRO** do padrão médio de consumo."
+                                padrao_texto = f"A quantidade encontrada está **DENTRO** do padrão médio {tipo_media} de consumo."
                                 padrao_cor = "#FFD700"
 
                             st.markdown(f"""

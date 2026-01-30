@@ -1,0 +1,156 @@
+[{
+  "_id": {
+    "$oid": "697cfb172a51240014b7b860"
+  },
+  "_lot": "00901697",
+  "samples": [
+    {
+      "released": false,
+      "_id": {
+        "$oid": "697cfb172a51240014b7b862"
+      },
+      "_sample": "72701522",
+      "positive": true,
+      "_compound": [
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496416"
+          },
+          "concentration": 0.006278047792112936,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c49640a"
+          },
+          "concentration": 0.005915790443312397,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c49640d"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496407"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496410"
+          },
+          "concentration": 0.1463046043262292,
+          "lsqOverflow": false,
+          "positive": true
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496415"
+          },
+          "concentration": 0.25,
+          "lsqOverflow": true,
+          "positive": true
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496413"
+          },
+          "concentration": 1.3838526606434864,
+          "lsqOverflow": false,
+          "positive": true
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496412"
+          },
+          "concentration": 0.019545499288864857,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c49640b"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c49640e"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496409"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c49640c"
+          },
+          "concentration": 0.011281122469588917,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496408"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496414"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c49640f"
+          },
+          "concentration": 0,
+          "lsqOverflow": false,
+          "positive": false
+        },
+        {
+          "_id": {
+            "$oid": "5cdf0e844040d61c3c496411"
+          },
+          "concentration": 0.010606036392706235,
+          "lsqOverflow": false,
+          "positive": false
+        }
+      ]
+    }
+  ],
+  "_createdBy": {
+    "$oid": "5accd8bc22e6d90010663c8c"
+  },
+  "createdAt": {
+    "$date": "2026-01-30T18:40:23.326Z"
+  },
+  "updatedAt": {
+    "$date": "2026-01-30T18:40:23.326Z"
+  },
+  "__v": 0
+}]
