@@ -756,6 +756,7 @@ PURPOSE_MAP = {
     "clt": "CLT",
     "cltCnh": "CLT + CNH",
     "civilService": "Concurso Público",
+    "againstProof": "Contra Prova",
 }
 
 
@@ -1887,6 +1888,7 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
             "clt": "CLT",
             "cltCnh": "CLT + CNH",
             "civilService": "Concurso Público",
+            "againstProof": "Contra Prova",
             "periodic": "Periódico",
             "categoryChange": "Mudança de Categoria",
             "hiring": "Admissão",
@@ -1963,6 +1965,7 @@ def render_visao_geral():
             "CLT": "clt",
             "CLT + CNH": "cltCnh",
             "Concurso Público": "civilService",
+            "Contra Prova": "againstProof",
         }
         selected_finalidade_name = st.selectbox(
             "Finalidade da Amostra",
@@ -2586,6 +2589,7 @@ def render_perfil_demografico():
             "CLT": "clt",
             "CLT + CNH": "cltCnh",
             "Concurso Público": "civilService",
+            "Contra Prova": "againstProof",
         }
         selected_finalidade_name = st.selectbox(
             "Finalidade da Amostra",
@@ -3653,6 +3657,7 @@ def get_positivity_by_purpose(
             "clt": "CLT",
             "cltCnh": "CLT + CNH",
             "civilService": "Concurso Público",
+            "againstProof": "Contra Prova",
             "periodic": "Periódico",
             "categoryChange": "Mudança de Categoria",
             "hiring": "Admissão",
@@ -5299,6 +5304,7 @@ def render_mapa():
             "CLT": "clt",
             "CLT + CNH": "cltCnh",
             "Concurso Público": "civilService",
+            "Contra Prova": "againstProof",
         }
         selected_finalidade_name = st.selectbox("Finalidade", options=list(finalidades.keys()), index=0, key="mapa_finalidade")
         selected_purpose = finalidades[selected_finalidade_name]
