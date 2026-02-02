@@ -147,7 +147,7 @@ def clear_cache(cache_name: str = None):
 
 def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
     """
-    Executa uma lista de tarefas mostrando progress bar.
+    Executa uma lista de tarefas mostrando progress bar usando placeholder.
 
     Args:
         tasks: lista de tuplas [(nome, funcao, args, kwargs), ...]
@@ -160,7 +160,8 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
     results = {}
     total = len(tasks)
 
-    progress_bar = st.progress(0, text=message)
+    # Usar placeholder para evitar blur/dimming
+    placeholder = st.empty()
 
     for i, task in enumerate(tasks):
         if len(task) == 2:
@@ -172,9 +173,9 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
         else:
             name, func, args, kwargs = task
 
-        # Atualizar progress bar
+        # Atualizar progress bar dentro do placeholder
         progress = (i) / total
-        progress_bar.progress(progress, text=f"{message} ({name})")
+        placeholder.progress(progress, text=f"{message} ({name})")
 
         try:
             if args and kwargs:
@@ -190,16 +191,16 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
             st.error(f"Erro ao carregar {name}: {e}")
 
     # Completar progress bar
-    progress_bar.progress(1.0, text="Concluído!")
+    placeholder.progress(1.0, text="Concluído!")
     time.sleep(0.3)  # Pequeno delay para mostrar "Concluído!"
-    progress_bar.empty()  # Remove a barra
+    placeholder.empty()  # Remove o placeholder
 
     return results
 
 
 def loading_single(func, message: str = "Carregando...", *args, **kwargs):
     """
-    Executa uma única função mostrando progress bar simples.
+    Executa uma única função mostrando progress bar simples usando placeholder.
 
     Args:
         func: função a executar
@@ -209,20 +210,67 @@ def loading_single(func, message: str = "Carregando...", *args, **kwargs):
     Returns:
         resultado da função
     """
-    progress_bar = st.progress(0, text=message)
+    # Usar placeholder para evitar blur/dimming
+    placeholder = st.empty()
 
     # Simular progresso inicial
-    progress_bar.progress(0.3, text=message)
+    placeholder.progress(0.3, text=message)
 
     try:
         result = func(*args, **kwargs)
-        progress_bar.progress(1.0, text="Concluído!")
+        placeholder.progress(1.0, text="Concluído!")
         time.sleep(0.2)
-        progress_bar.empty()
+        placeholder.empty()
         return result
     except Exception as e:
-        progress_bar.empty()
+        placeholder.empty()
         raise e
+
+
+def render_page_with_loading(page_name: str, render_func: callable):
+    """
+    Wrapper que mostra loader customizado antes de renderizar a página.
+    Evita o efeito de dimming do Streamlit durante operações de I/O.
+    """
+    # Placeholder para o loader
+    loader_placeholder = st.empty()
+    content_placeholder = st.container()
+
+    # Mostrar loader imediatamente
+    with loader_placeholder:
+        st.markdown(f"""
+        <div style="
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 3rem;
+            color: #888;
+        ">
+            <div style="
+                width: 40px;
+                height: 40px;
+                border: 3px solid #f3f3f3;
+                border-top: 3px solid #0066CC;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+            "></div>
+            <p style="margin-top: 1rem;">Carregando {page_name}...</p>
+        </div>
+        <style>
+            @keyframes spin {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+        </style>
+        """, unsafe_allow_html=True)
+
+    # Renderizar conteúdo
+    with content_placeholder:
+        render_func()
+
+    # Remover loader
+    loader_placeholder.empty()
 
 
 def run_parallel_tasks(tasks: dict, max_workers: int = 5) -> dict:
@@ -917,6 +965,21 @@ GLOBAL_CSS = """
     [data-testid="stSidebar"] .stMarkdown {
         color: #E8E8E8;
     }
+
+    /* Desabilitar efeito de dimming durante carregamento */
+    div[data-testid="stAppViewBlockContainer"] {
+        opacity: 1 !important;
+    }
+    .stSpinner {
+        background: transparent !important;
+    }
+    div[data-testid="stStatusWidget"] {
+        display: none;
+    }
+    /* Manter conteúdo visível durante rerun */
+    .stApp > div {
+        opacity: 1 !important;
+    }
 </style>
 """
 
@@ -1054,23 +1117,23 @@ def main():
                 st.session_state.base_data_loaded = False
                 st.rerun()
 
-    # Roteamento de páginas
+    # Roteamento de páginas com loader customizado para evitar dimming
     if pagina == "🏠 Visão Geral":
-        render_visao_geral()
+        render_page_with_loading("Visão Geral", render_visao_geral)
     elif pagina == "👤 Perfil Demográfico":
-        render_perfil_demografico()
+        render_page_with_loading("Perfil Demográfico", render_perfil_demografico)
     elif pagina == "🧪 Substâncias":
-        render_substancias()
+        render_page_with_loading("Substâncias", render_substancias)
     elif pagina == "🗺️ Mapa Geográfico":
-        render_mapa()
+        render_page_with_loading("Mapa Geográfico", render_mapa)
     elif pagina == "📈 Análise Temporal":
-        render_temporal()
+        render_page_with_loading("Análise Temporal", render_temporal)
     elif pagina == "📋 Tabela Detalhada":
-        render_tabela_detalhada()
+        render_page_with_loading("Tabela Detalhada", render_tabela_detalhada)
     elif pagina == "🔍 Auditoria":
-        render_auditoria()
+        render_page_with_loading("Auditoria", render_auditoria)
     elif pagina == "🏢 Rede":
-        render_rede()
+        render_page_with_loading("Rede", render_rede)
 
 
 # ============================================
@@ -1097,7 +1160,7 @@ def get_substance_data() -> pd.DataFrame:
         lots_collection = get_collection("lots")
         lots_period = list(lots_collection.find(
             {"createdAt": {"$gte": start_date, "$lte": end_date}},
-            {"code": 1, "analysisType": 1, "createdAt": 1, "_chainOfCustody": 1}
+            {"code": 1, "analysisType": 1, "createdAt": 1, "_samples": 1}
         ))
 
         if not lots_period:
@@ -1107,13 +1170,14 @@ def get_substance_data() -> pd.DataFrame:
         lot_codes = []
         lot_type_map = {}
         lot_date_map = {}
-        lot_chain_map = {}  # Mapeamento lote -> chainOfCustody
+        lot_samples_map = {}  # Mapeamento lote -> lista de sample_ids (chainsOfCustody._id)
         analysis_type_names = {
             "screening": "Triagem",
             "confirmatory": "Confirmatório",
             "confirmatoryTHC": "Confirmatório THC"
         }
 
+        all_sample_ids = []  # Todos os _samples de todos os lotes
         for lot in lots_period:
             code = lot.get('code')
             if code:
@@ -1127,32 +1191,44 @@ def get_substance_data() -> pd.DataFrame:
                     lot_date_map[code] = created_at_brt.strftime('%d/%m/%Y')
                 else:
                     lot_date_map[code] = 'N/A'
-                # Guardar chainOfCustody
-                chain_id = lot.get('_chainOfCustody')
-                if chain_id:
-                    lot_chain_map[code] = chain_id
+                # Guardar _samples (são os IDs das chainsOfCustody)
+                samples = lot.get('_samples', [])
+                if samples:
+                    lot_samples_map[code] = samples
+                    all_sample_ids.extend(samples)
 
-        # 1.1 Buscar gatherings para mapear chainOfCustody -> purpose.subType
+        # 1.1 Buscar gatherings para mapear chainOfCustody -> purpose.type e purpose.subType
+        # Caminho: lots._samples = chainsOfCustody._id -> gatherings._chainOfCustody
         client = get_mongo_client()
         db = client["ctox"]
         gatherings_collection = db["gatherings"]
 
-        chain_ids = list(set(lot_chain_map.values()))
+        # Buscar todos os gatherings que referenciam as chainsOfCustody dos lotes
+        unique_sample_ids = list(set(all_sample_ids))
         gatherings = list(gatherings_collection.find(
-            {"_chainOfCustody": {"$in": chain_ids}},
-            {"_chainOfCustody": 1, "purpose.subType": 1}
+            {"_chainOfCustody": {"$in": unique_sample_ids}},
+            {"_chainOfCustody": 1, "purpose.type": 1, "purpose.subType": 1}
         ))
 
-        # Mapeamento chain -> subType
+        # Mapeamento chainOfCustody._id -> type e subType
+        chain_to_type = {}
         chain_to_subtype = {}
         for g in gatherings:
             chain_id = g.get("_chainOfCustody")
             purpose = g.get("purpose", {})
+            ptype = purpose.get("type", "") if purpose else ""
             subtype = purpose.get("subType", "") if purpose else ""
             if chain_id:
+                chain_to_type[chain_id] = ptype
                 chain_to_subtype[chain_id] = subtype
 
-        # Mapeamento lote -> subType (traduzido)
+        # Mapeamentos para tradução
+        tipos_map = {
+            "cnh": "CNH",
+            "clt": "CLT",
+            "cltCnh": "CLT + CNH"
+        }
+
         subtipos_map = {
             "periodic": "Periódico",
             "hiring": "Admissional",
@@ -1165,10 +1241,21 @@ def get_substance_data() -> pd.DataFrame:
             "return": "Retorno ao Trabalho"
         }
 
-        lot_finalidade_map = {}
-        for lot_code, chain_id in lot_chain_map.items():
-            subtype = chain_to_subtype.get(chain_id, "")
-            lot_finalidade_map[lot_code] = subtipos_map.get(subtype, subtype) if subtype else "N/A"
+        # Mapeamento lote -> tipo e subtipo (traduzidos)
+        # Como um lote pode ter várias amostras, pegamos o tipo/subtipo da primeira amostra que tiver dados
+        lot_tipo_map = {}
+        lot_subtipo_map = {}
+        for lot_code, sample_ids in lot_samples_map.items():
+            ptype = ""
+            subtype = ""
+            # Procurar o primeiro sample_id que tenha tipo/subtipo definido
+            for sample_id in sample_ids:
+                if sample_id in chain_to_type and chain_to_type[sample_id]:
+                    ptype = chain_to_type[sample_id]
+                    subtype = chain_to_subtype.get(sample_id, "")
+                    break
+            lot_tipo_map[lot_code] = tipos_map.get(ptype, ptype) if ptype else "N/A"
+            lot_subtipo_map[lot_code] = subtipos_map.get(subtype, subtype) if subtype else "N/A"
 
         # 2. Aggregation pipeline no MongoDB
         client = get_mongo_client()
@@ -1242,16 +1329,17 @@ def get_substance_data() -> pd.DataFrame:
         # 5. Juntar metadados com dados pivotados
         df_final = df_meta.merge(df_pivot, on='_sample', how='left')
 
-        # 6. Adicionar colunas de Data, Tipo de Lote e Finalidade
+        # 6. Adicionar colunas de Data, Tipo de Lote, Tipo Finalidade e Subfinalidade
         df_final['Data'] = df_final['_lot'].map(lot_date_map).fillna('N/A')
         df_final['Tipo de Lote'] = df_final['_lot'].map(lot_type_map).fillna('N/A')
-        df_final['Finalidade'] = df_final['_lot'].map(lot_finalidade_map).fillna('N/A')
+        df_final['Tipo Exame'] = df_final['_lot'].map(lot_tipo_map).fillna('N/A')
+        df_final['Subfinalidade'] = df_final['_lot'].map(lot_subtipo_map).fillna('N/A')
 
         # 7. Renomear e reorganizar colunas
         df_final = df_final.rename(columns={'_lot': 'Lote', '_sample': 'Amostra'})
 
-        # Reordenar: Data, Lote, Tipo de Lote, Finalidade, Amostra, depois as substâncias
-        first_cols = ['Data', 'Lote', 'Tipo de Lote', 'Finalidade', 'Amostra']
+        # Reordenar: Data, Lote, Tipo de Lote, Tipo Exame, Subfinalidade, Amostra, depois as substâncias
+        first_cols = ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']
         other_cols = [col for col in df_final.columns if col not in first_cols and col != 'samplePositive']
         df_final = df_final[first_cols + sorted(other_cols)]
 
@@ -5974,7 +6062,8 @@ def render_tabela_detalhada():
     # Filtros
     st.markdown("### 🔍 Filtros")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # Primeira linha de filtros
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         filtro_lote = st.text_input("Lote", placeholder="Digite o código do lote...", key="det_lote")
@@ -5990,20 +6079,26 @@ def render_tabela_detalhada():
         substancias_opcoes = ['Todas'] + list(compounds_map.values())
         filtro_substancia = st.selectbox("Substância Positiva", substancias_opcoes, key="det_substancia")
 
-    with col5:
-        # Opções de finalidade (subType traduzido)
-        finalidades_opcoes = [
-            "Todas",
-            "Admissional",
-            "Periódico",
-            "Demissional",
-            "Primeira Habilitação",
-            "Renovação",
-            "Mudança de Categoria",
-            "Mudança de Função",
-            "Retorno ao Trabalho"
-        ]
-        filtro_finalidade = st.selectbox("Finalidade da Amostra", finalidades_opcoes, key="det_finalidade")
+    # Segunda linha: Filtros em cascata de Finalidade
+    col_tipo, col_sub = st.columns(2)
+
+    with col_tipo:
+        # Tipo de Exame (CNH, CLT, CLT + CNH)
+        tipos_exame_opcoes = ["Todos", "CNH", "CLT", "CLT + CNH"]
+        filtro_tipo_exame = st.selectbox("Tipo de Exame", tipos_exame_opcoes, key="det_tipo_exame")
+
+    with col_sub:
+        # Subfinalidades dependem do tipo selecionado
+        # Mapeamento de quais subfinalidades pertencem a cada tipo
+        subfinalidades_por_tipo = {
+            "CNH": ["Todas", "Primeira Habilitação", "Renovação", "Mudança de Categoria"],
+            "CLT": ["Todas", "Admissional", "Periódico", "Demissional", "Mudança de Função", "Retorno ao Trabalho"],
+            "CLT + CNH": ["Todas", "Admissional", "Periódico", "Demissional", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Mudança de Função", "Retorno ao Trabalho"],
+            "Todos": ["Todas", "Admissional", "Periódico", "Demissional", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Mudança de Função", "Retorno ao Trabalho"]
+        }
+
+        subfinalidades_disponiveis = subfinalidades_por_tipo.get(filtro_tipo_exame, subfinalidades_por_tipo["Todos"])
+        filtro_subfinalidade = st.selectbox("Subfinalidade", subfinalidades_disponiveis, key="det_subfinalidade")
 
     st.markdown("---")
 
@@ -6014,7 +6109,7 @@ def render_tabela_detalhada():
         return
 
     # Colunas de substâncias (excluindo colunas de metadados)
-    substance_cols = [col for col in df.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Finalidade', 'Amostra']]
+    substance_cols = [col for col in df.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']]
 
     # Aplicar filtros
     df_filtrado = df.copy()
@@ -6033,8 +6128,12 @@ def render_tabela_detalhada():
     if filtro_substancia != 'Todas':
         df_filtrado = df_filtrado[df_filtrado[filtro_substancia] == 'Positivo']
 
-    if filtro_finalidade != 'Todas':
-        df_filtrado = df_filtrado[df_filtrado['Finalidade'] == filtro_finalidade]
+    # Aplicar filtros em cascata de finalidade
+    if filtro_tipo_exame != 'Todos':
+        df_filtrado = df_filtrado[df_filtrado['Tipo Exame'] == filtro_tipo_exame]
+
+    if filtro_subfinalidade != 'Todas':
+        df_filtrado = df_filtrado[df_filtrado['Subfinalidade'] == filtro_subfinalidade]
 
     # ============================================
     # COMPARATIVO DE CONCENTRAÇÃO (quando filtrar por amostra específica)
@@ -6065,13 +6164,6 @@ def render_tabela_detalhada():
         if lab_info.get("lab_name"):
             lab_location = f"{lab_info.get('lab_city', '')}/{lab_info.get('lab_state', '')}" if lab_info.get('lab_city') else ""
             st.info(f"🏢 **Laboratório:** {lab_info['lab_name']} {f'({lab_location})' if lab_location else ''}")
-
-        # DEBUG: Verificar dados do laboratório
-        with st.expander("🔍 Debug - Dados do Laboratório", expanded=False):
-            st.write(f"Lab Info: {lab_info}")
-            st.write(f"Média do Lab encontrada: {len(avg_data_lab)} substâncias")
-            if avg_data_lab:
-                st.json({k: v for k, v in list(avg_data_lab.items())[:5]})
 
         if concentration_data:
             # Filtrar apenas substâncias positivas na amostra
@@ -6229,7 +6321,7 @@ def render_tabela_detalhada():
         - Células de substâncias positivas: texto branco, negrito
         """
         # Colunas de substâncias
-        sub_cols = [col for col in df.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Finalidade', 'Amostra']]
+        sub_cols = [col for col in df.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']]
 
         # Criar DataFrame de estilos
         styles = pd.DataFrame('', index=df.index, columns=df.columns)
