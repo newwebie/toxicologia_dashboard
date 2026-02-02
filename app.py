@@ -227,49 +227,56 @@ def loading_single(func, message: str = "Carregando...", *args, **kwargs):
         raise e
 
 
+def show_loading_spinner(page_name: str):
+    """
+    Mostra spinner central de carregamento com overlay que esconde o conteúdo.
+    """
+    st.markdown(f"""
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Carregando {page_name}...</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def hide_loading_spinner():
+    """
+    Injeta script para remover o overlay de carregamento.
+    """
+    st.markdown("""
+    <script>
+        var overlay = document.getElementById('loading-overlay');
+        if (overlay) {
+            overlay.style.opacity = '0';
+            setTimeout(function() {
+                overlay.style.display = 'none';
+            }, 300);
+        }
+    </script>
+    <style>
+        #loading-overlay {
+            display: none !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 def render_page_with_loading(page_name: str, render_func: callable):
     """
-    Wrapper que mostra loader customizado antes de renderizar a página.
-    Evita o efeito de dimming do Streamlit durante operações de I/O.
+    Wrapper que mostra spinner central antes de renderizar a página.
+    Esconde o conteúdo durante carregamento e mostra após finalizar.
     """
     # Placeholder para o loader
     loader_placeholder = st.empty()
-    content_placeholder = st.container()
 
-    # Mostrar loader imediatamente
+    # Mostrar spinner imediatamente
     with loader_placeholder:
-        st.markdown(f"""
-        <div style="
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 3rem;
-            color: #888;
-        ">
-            <div style="
-                width: 40px;
-                height: 40px;
-                border: 3px solid #f3f3f3;
-                border-top: 3px solid #0066CC;
-                border-radius: 50%;
-                animation: spin 1s linear infinite;
-            "></div>
-            <p style="margin-top: 1rem;">Carregando {page_name}...</p>
-        </div>
-        <style>
-            @keyframes spin {{
-                0% {{ transform: rotate(0deg); }}
-                100% {{ transform: rotate(360deg); }}
-            }}
-        </style>
-        """, unsafe_allow_html=True)
+        show_loading_spinner(page_name)
 
     # Renderizar conteúdo
-    with content_placeholder:
-        render_func()
+    render_func()
 
-    # Remover loader
+    # Remover loader e mostrar conteúdo
     loader_placeholder.empty()
 
 
@@ -980,6 +987,51 @@ GLOBAL_CSS = """
     /* Manter conteúdo visível durante rerun */
     .stApp > div {
         opacity: 1 !important;
+    }
+
+    /* Spinner central de carregamento */
+    .loading-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(14, 17, 23, 0.95);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+    }
+    .loading-spinner {
+        width: 50px;
+        height: 50px;
+        border: 4px solid rgba(255, 255, 255, 0.1);
+        border-top: 4px solid #0066CC;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+    }
+    .loading-text {
+        margin-top: 1.5rem;
+        color: #FAFAFA;
+        font-size: 1.1rem;
+        font-weight: 500;
+    }
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    /* Esconder conteúdo durante carregamento */
+    .content-hidden {
+        visibility: hidden;
+        opacity: 0;
+        height: 0;
+        overflow: hidden;
+    }
+    .content-visible {
+        visibility: visible;
+        opacity: 1;
+        transition: opacity 0.3s ease-in;
     }
 </style>
 """
@@ -1932,34 +1984,10 @@ def render_visao_geral():
     # Filtros
     st.markdown("### 🔍 Filtros")
 
-    col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
-
-    # Filtro de Mês
-    with col_filtro1:
-        meses = {
-            "Todos": None,
-            "Janeiro": 1,
-            "Fevereiro": 2,
-            "Março": 3,
-            "Abril": 4,
-            "Maio": 5,
-            "Junho": 6,
-            "Julho": 7,
-            "Agosto": 8,
-            "Setembro": 9,
-            "Outubro": 10,
-            "Novembro": 11,
-            "Dezembro": 12
-        }
-        selected_mes_name = st.selectbox(
-            "Mês",
-            options=list(meses.keys()),
-            index=0
-        )
-        selected_month = meses[selected_mes_name]
+    col_filtro1, col_filtro2 = st.columns(2)
 
     # Filtro de Finalidade
-    with col_filtro2:
+    with col_filtro1:
         finalidades = {
             "Todas": None,
             "CLT": "clt",
@@ -1975,7 +2003,7 @@ def render_visao_geral():
         selected_purpose = finalidades[selected_finalidade_name]
 
     # Filtro de Laboratório por CNPJ - MÚLTIPLA SELEÇÃO
-    with col_filtro3:
+    with col_filtro2:
         labs_by_cnpj = get_laboratories_by_cnpj()
         cnpj_options = sorted(labs_by_cnpj.keys())
 
@@ -2013,46 +2041,45 @@ def render_visao_geral():
 
         # Carregar dados para cada CNPJ
         dados_por_cnpj = {}
-        with st.spinner("Carregando dados dos laboratórios..."):
-            for cnpj in selected_cnpjs:
-                lab_id = labs_by_cnpj[cnpj]["id"]
-                lab_name = labs_by_cnpj[cnpj]["name"]
+        for cnpj in selected_cnpjs:
+            lab_id = labs_by_cnpj[cnpj]["id"]
+            lab_name = labs_by_cnpj[cnpj]["name"]
 
-                triagem = get_triagem_data(lab_id, selected_month, selected_purpose)
-                confirmatorio = get_confirmatorio_data(lab_id, selected_month, selected_purpose)
-                confirmatorio_thc = get_confirmatorio_thc_data(lab_id, selected_month, selected_purpose)
+            triagem = get_triagem_data(lab_id, None, selected_purpose)
+            confirmatorio = get_confirmatorio_data(lab_id, None, selected_purpose)
+            confirmatorio_thc = get_confirmatorio_thc_data(lab_id, None, selected_purpose)
 
-                total_tri = triagem["positivo"] + triagem["negativo"]
-                total_conf = confirmatorio["positivo"] + confirmatorio["negativo"]
-                total_conf_thc = confirmatorio_thc["positivo"] + confirmatorio_thc["negativo"]
-                total = total_tri + total_conf + total_conf_thc
+            total_tri = triagem["positivo"] + triagem["negativo"]
+            total_conf = confirmatorio["positivo"] + confirmatorio["negativo"]
+            total_conf_thc = confirmatorio_thc["positivo"] + confirmatorio_thc["negativo"]
+            total = total_tri + total_conf + total_conf_thc
 
-                # Confirmatório combinado
-                total_conf_geral = total_conf + total_conf_thc
-                pos_conf_geral = confirmatorio["positivo"] + confirmatorio_thc["positivo"]
-                neg_conf_geral = confirmatorio["negativo"] + confirmatorio_thc["negativo"]
+            # Confirmatório combinado
+            total_conf_geral = total_conf + total_conf_thc
+            pos_conf_geral = confirmatorio["positivo"] + confirmatorio_thc["positivo"]
+            neg_conf_geral = confirmatorio["negativo"] + confirmatorio_thc["negativo"]
 
-                # Taxa geral: positivas confirmatórias / total triagem
-                taxa_geral = (pos_conf_geral / total_tri * 100) if total_tri > 0 else 0
+            # Taxa geral: positivas confirmatórias / total triagem
+            taxa_geral = (pos_conf_geral / total_tri * 100) if total_tri > 0 else 0
 
-                # Diferença vs média nacional
-                dif_nacional = taxa_geral - taxa_nacional if taxa_nacional > 0 else 0
+            # Diferença vs média nacional
+            dif_nacional = taxa_geral - taxa_nacional if taxa_nacional > 0 else 0
 
-                dados_por_cnpj[cnpj] = {
-                    "nome": lab_name,
-                    "triagem": triagem,
-                    "confirmatorio": confirmatorio,
-                    "confirmatorio_thc": confirmatorio_thc,
-                    "total_triagem": total_tri,
-                    "total_confirmatorio": total_conf,
-                    "total_confirmatorio_thc": total_conf_thc,
-                    "total_confirmatorio_geral": total_conf_geral,
-                    "pos_confirmatorio_geral": pos_conf_geral,
-                    "neg_confirmatorio_geral": neg_conf_geral,
-                    "total": total,
-                    "taxa_geral": taxa_geral,
-                    "dif_nacional": dif_nacional
-                }
+            dados_por_cnpj[cnpj] = {
+                "nome": lab_name,
+                "triagem": triagem,
+                "confirmatorio": confirmatorio,
+                "confirmatorio_thc": confirmatorio_thc,
+                "total_triagem": total_tri,
+                "total_confirmatorio": total_conf,
+                "total_confirmatorio_thc": total_conf_thc,
+                "total_confirmatorio_geral": total_conf_geral,
+                "pos_confirmatorio_geral": pos_conf_geral,
+                "neg_confirmatorio_geral": neg_conf_geral,
+                "total": total,
+                "taxa_geral": taxa_geral,
+                "dif_nacional": dif_nacional
+            }
 
         # Criar DataFrame para comparação
         df_comparacao = pd.DataFrame([
@@ -2259,11 +2286,11 @@ def render_visao_geral():
         first_lab_id = selected_lab_ids[0] if selected_lab_ids and len(selected_lab_ids) == 1 else None
 
         tasks = [
-            ("Triagem", get_triagem_data, (first_lab_id, selected_month, selected_purpose)),
-            ("Confirmatório", get_confirmatorio_data, (first_lab_id, selected_month, selected_purpose)),
-            ("Confirmatório THC", get_confirmatorio_thc_data, (first_lab_id, selected_month, selected_purpose)),
-            ("RENACH", get_renach_data, (first_lab_id, selected_month, selected_purpose)),
-            ("Finalidades", get_samples_by_purpose, (first_lab_id, selected_month)),
+            ("Triagem", get_triagem_data, (first_lab_id, None, selected_purpose)),
+            ("Confirmatório", get_confirmatorio_data, (first_lab_id, None, selected_purpose)),
+            ("Confirmatório THC", get_confirmatorio_thc_data, (first_lab_id, None, selected_purpose)),
+            ("RENACH", get_renach_data, (first_lab_id, None, selected_purpose)),
+            ("Finalidades", get_samples_by_purpose, (first_lab_id, None)),
         ]
         data = loading_with_progress(tasks, "Carregando visão geral...")
         triagem_data = data["Triagem"]
@@ -2554,35 +2581,10 @@ def render_perfil_demografico():
     # Filtros
     st.markdown("### 🔍 Filtros")
 
-    col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
-
-    # Filtro de Mês
-    with col_filtro1:
-        meses = {
-            "Todos": None,
-            "Janeiro": 1,
-            "Fevereiro": 2,
-            "Março": 3,
-            "Abril": 4,
-            "Maio": 5,
-            "Junho": 6,
-            "Julho": 7,
-            "Agosto": 8,
-            "Setembro": 9,
-            "Outubro": 10,
-            "Novembro": 11,
-            "Dezembro": 12
-        }
-        selected_mes_name = st.selectbox(
-            "Mês",
-            options=list(meses.keys()),
-            index=0,
-            key="demo_filtro_mes"
-        )
-        selected_month = meses[selected_mes_name]
+    col_filtro1, col_filtro2 = st.columns(2)
 
     # Filtro de Finalidade
-    with col_filtro2:
+    with col_filtro1:
         finalidades = {
             "Todas": None,
             "CNH": "cnh",
@@ -2600,7 +2602,7 @@ def render_perfil_demografico():
         selected_purpose = finalidades[selected_finalidade_name]
 
     # Filtro de Laboratório por CNPJ
-    with col_filtro3:
+    with col_filtro2:
         labs_by_cnpj = get_laboratories_by_cnpj()
         cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
 
@@ -2634,7 +2636,7 @@ def render_perfil_demografico():
     df_demo_raw = loading_single(
         get_demographic_raw_data,
         "Carregando dados demográficos...",
-        selected_lab_id, selected_month, selected_purpose
+        selected_lab_id, None, selected_purpose
     )
 
     if df_demo_raw is not None and not df_demo_raw.empty:
@@ -4518,7 +4520,7 @@ def render_substancias():
 
     # Filtros
     st.markdown("### 🔍 Filtros")
-    col_f1, col_f2, col_f3 = st.columns(3)
+    col_f1, col_f2 = st.columns(2)
 
     with col_f1:
         labs_by_cnpj = get_laboratories_by_cnpj()
@@ -4544,20 +4546,12 @@ def render_substancias():
             selected_lab_state = None
 
     with col_f2:
-        meses = {
-            "Todos": None, "Janeiro": 1, "Fevereiro": 2, "Março": 3,
-            "Abril": 4, "Maio": 5, "Junho": 6, "Julho": 7,
-            "Agosto": 8, "Setembro": 9, "Outubro": 10, "Novembro": 11, "Dezembro": 12
-        }
-        selected_mes_name = st.selectbox("Mês", options=list(meses.keys()), index=0, key="subst_mes")
-        selected_month = meses[selected_mes_name]
-
-    with col_f3:
         analysis_options = {
             "Todos": "all",
             "Triagem": "screening",
             "Confirmatório": "confirmatory",
-            "Confirmatório THC": "confirmatoryTHC"
+            "Confirmatório THC": "confirmatoryTHC",
+            "Contra Prova": "againstProof"
         }
         selected_analysis_name = st.selectbox(
             "Tipo de Análise",
@@ -4576,7 +4570,7 @@ def render_substancias():
 
     substance_stats = loading_single(
         get_substance_statistics, "Carregando dados de substâncias...",
-        selected_lab_id, selected_month, selected_analysis
+        selected_lab_id, None, selected_analysis
     )
 
     if not substance_stats:
@@ -5282,23 +5276,14 @@ def render_mapa():
     st.title("🗺️ Mapa Geográfico")
 
     # Filtros
-    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+    col_f1, col_f2, col_f3 = st.columns(3)
 
     with col_f1:
-        meses = {
-            "Todos": None, "Janeiro": 1, "Fevereiro": 2, "Março": 3,
-            "Abril": 4, "Maio": 5, "Junho": 6, "Julho": 7,
-            "Agosto": 8, "Setembro": 9, "Outubro": 10, "Novembro": 11, "Dezembro": 12
-        }
-        selected_mes = st.selectbox("Mês", options=list(meses.keys()), index=0, key="mapa_mes")
-        selected_month = meses[selected_mes]
-
-    with col_f2:
-        analysis_options = {"Todos": "all", "Triagem": "screening", "Confirmatório": "confirmatory"}
+        analysis_options = {"Todos": "all", "Triagem": "screening", "Confirmatório": "confirmatory", "Contra Prova": "againstProof"}
         selected_analysis = st.selectbox("Tipo de Análise", options=list(analysis_options.keys()), index=0, key="mapa_analysis")
         analysis_type = analysis_options[selected_analysis]
 
-    with col_f3:
+    with col_f2:
         finalidades = {
             "Todas": None,
             "CLT": "clt",
@@ -5309,7 +5294,7 @@ def render_mapa():
         selected_finalidade_name = st.selectbox("Finalidade", options=list(finalidades.keys()), index=0, key="mapa_finalidade")
         selected_purpose = finalidades[selected_finalidade_name]
 
-    with col_f4:
+    with col_f3:
         labs_by_cnpj = get_laboratories_by_cnpj()
         cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
         selected_cnpj = st.selectbox("CNPJ Laboratório", options=cnpj_options, index=0, key="mapa_cnpj")
@@ -5324,7 +5309,7 @@ def render_mapa():
 
     geo_data = loading_single(
         get_geographic_data, "Carregando dados geográficos...",
-        selected_month, analysis_type, selected_lab_id, selected_purpose
+        None, analysis_type, selected_lab_id, selected_purpose
     )
 
     if not geo_data:
