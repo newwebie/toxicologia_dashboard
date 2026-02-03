@@ -145,7 +145,7 @@ def clear_cache(cache_name: str = None):
         st.session_state.data_cache = {}
 
 
-def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
+def loading_with_progress(tasks: list, message: str = "Carregando dados...", silent: bool = False):
     """
     Executa uma lista de tarefas mostrando progress bar usando placeholder.
 
@@ -153,6 +153,7 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
         tasks: lista de tuplas [(nome, funcao, args, kwargs), ...]
                ou [(nome, funcao), ...] para funções sem argumentos
         message: mensagem exibida durante o carregamento
+        silent: se True, não mostra progress bar (carregamento silencioso)
 
     Returns:
         dict com {nome: resultado}
@@ -160,8 +161,8 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
     results = {}
     total = len(tasks)
 
-    # Usar placeholder para evitar blur/dimming
-    placeholder = st.empty()
+    # Usar placeholder para evitar blur/dimming (só se não for silencioso)
+    placeholder = st.empty() if not silent else None
 
     for i, task in enumerate(tasks):
         if len(task) == 2:
@@ -173,9 +174,10 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
         else:
             name, func, args, kwargs = task
 
-        # Atualizar progress bar dentro do placeholder
-        progress = (i) / total
-        placeholder.progress(progress, text=f"{message} ({name})")
+        # Atualizar progress bar dentro do placeholder (só se não for silencioso)
+        if placeholder:
+            progress = (i) / total
+            placeholder.progress(progress, text=f"{message} ({name})")
 
         try:
             if args and kwargs:
@@ -188,12 +190,14 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados..."):
                 results[name] = func()
         except Exception as e:
             results[name] = None
-            st.error(f"Erro ao carregar {name}: {e}")
+            if not silent:
+                st.error(f"Erro ao carregar {name}: {e}")
 
-    # Completar progress bar
-    placeholder.progress(1.0, text="Concluído!")
-    time.sleep(0.3)  # Pequeno delay para mostrar "Concluído!"
-    placeholder.empty()  # Remove o placeholder
+    # Completar progress bar (só se não for silencioso)
+    if placeholder:
+        placeholder.progress(1.0, text="Concluído!")
+        time.sleep(0.3)  # Pequeno delay para mostrar "Concluído!"
+        placeholder.empty()  # Remove o placeholder
 
     return results
 
@@ -280,6 +284,36 @@ def render_page_with_loading(page_name: str, render_func: callable):
     loader_placeholder.empty()
 
 
+def render_page_with_unified_loading(page_name: str, render_func: callable):
+    """
+    Carrega dados base + renderiza página em um único spinner.
+    Evita múltiplos indicadores de carregamento aparecendo sequencialmente.
+    """
+    # Verificar se precisa carregar dados base
+    needs_base_data = not st.session_state.get('base_data_loaded', False)
+
+    # Se precisa carregar dados, mostra spinner único para tudo
+    if needs_base_data:
+        # Placeholder para o loader
+        loader_placeholder = st.empty()
+
+        # Mostrar spinner imediatamente
+        with loader_placeholder:
+            show_loading_spinner(page_name)
+
+        # Carregar dados base silenciosamente (sem progress bar próprio)
+        load_base_data(silent=True)
+
+        # Renderizar conteúdo
+        render_func()
+
+        # Remover loader
+        loader_placeholder.empty()
+    else:
+        # Dados já carregados, só renderiza a página
+        render_page_with_loading(page_name, render_func)
+
+
 def run_parallel_tasks(tasks: dict, max_workers: int = 5) -> dict:
     """
     Executa múltiplas funções em paralelo usando ThreadPoolExecutor.
@@ -322,12 +356,14 @@ def run_parallel_tasks(tasks: dict, max_workers: int = 5) -> dict:
     return results
 
 
-def load_base_data():
+def load_base_data(silent: bool = False):
     """
     Carrega dados básicos que são usados em múltiplas páginas.
     Chamado uma vez no início da sessão.
-    Mostra progress bar durante o carregamento.
     Pré-carrega TODOS os dados do período padrão para acelerar consultas subsequentes.
+
+    Args:
+        silent: se True, não mostra progress bar (usado quando já há spinner global)
     """
     init_session_cache()
 
@@ -337,8 +373,8 @@ def load_base_data():
     # Garantir índices (só executa se necessário)
     ensure_indexes()
 
-    # Pré-carregar dados com progress bar
-    preload_all_data()
+    # Pré-carregar dados (silencioso se já houver spinner global)
+    preload_all_data(silent=silent)
 
     st.session_state.base_data_loaded = True
 
@@ -487,7 +523,7 @@ def get_all_results(start_date: datetime = None, end_date: datetime = None):
 def get_all_gatherings(start_date: datetime = None, end_date: datetime = None):
     """
     Pré-carrega mapeamento de chainOfCustody -> laboratory do período selecionado.
-    Retorna dict com chain_to_lab, chain_to_purpose e chain_to_date
+    Retorna dict com chain_to_lab, chain_to_purpose, chain_to_subtype e chain_to_date
     """
     try:
         gatherings_collection = get_collection("gatherings")
@@ -496,30 +532,40 @@ def get_all_gatherings(start_date: datetime = None, end_date: datetime = None):
 
         gatherings = list(gatherings_collection.find(
             {"createdAt": {"$gte": start_date, "$lte": end_date}},
-            {"_chainOfCustody": 1, "_laboratory": 1, "purpose.type": 1, "createdAt": 1}
+            {"_chainOfCustody": 1, "_laboratory": 1, "purpose.type": 1, "purpose.subType": 1, "createdAt": 1}
         ))
 
         chain_to_lab = {}
         chain_to_purpose = {}
+        chain_to_subtype = {}
         chain_to_date = {}
 
         for g in gatherings:
             chain_id = g.get('_chainOfCustody')
             lab_id = g.get('_laboratory')
-            purpose = g.get('purpose', {}).get('type')
+            purpose = g.get('purpose', {})
+            purpose_type = purpose.get('type') if purpose else None
+            purpose_subtype = purpose.get('subType') if purpose else None
             created_at = g.get('createdAt')
 
             if chain_id:
                 if lab_id:
                     chain_to_lab[chain_id] = str(lab_id) if isinstance(lab_id, ObjectId) else lab_id
-                if purpose:
-                    chain_to_purpose[chain_id] = purpose
+                if purpose_type:
+                    chain_to_purpose[chain_id] = purpose_type
+                if purpose_subtype:
+                    chain_to_subtype[chain_id] = purpose_subtype
                 if created_at:
                     chain_to_date[chain_id] = created_at
 
-        return {"chain_to_lab": chain_to_lab, "chain_to_purpose": chain_to_purpose, "chain_to_date": chain_to_date}
+        return {
+            "chain_to_lab": chain_to_lab,
+            "chain_to_purpose": chain_to_purpose,
+            "chain_to_subtype": chain_to_subtype,
+            "chain_to_date": chain_to_date
+        }
     except Exception as e:
-        return {"chain_to_lab": {}, "chain_to_purpose": {}, "chain_to_date": {}}
+        return {"chain_to_lab": {}, "chain_to_purpose": {}, "chain_to_subtype": {}, "chain_to_date": {}}
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -582,28 +628,80 @@ def get_renach_data_cached(start_date: datetime = None, end_date: datetime = Non
         return {}
 
 
-def preload_all_data():
+def preload_all_data(silent: bool = False):
     """
-    Pré-carrega todos os dados necessários com progress bar.
+    Pré-carrega todos os dados necessários usando paralelização.
     Chamado uma vez no início para popular o cache.
     Usa o período selecionado pelo usuário.
+
+    Args:
+        silent: se True, não mostra progress bar (usado quando já há spinner global)
     """
     # Obter período selecionado
     start_date, end_date = get_selected_period()
 
-    # Lista de tarefas para o progress bar
-    tasks = [
-        ("Lotes", get_all_lots, (start_date, end_date)),
-        ("Resultados", get_all_results, (start_date, end_date)),
-        ("Coletas", get_all_gatherings, (start_date, end_date)),
-        ("Mapeamento de amostras", get_chain_to_sample_map, (start_date, end_date)),
-        ("Dados RENACH", get_renach_data_cached, (start_date, end_date)),
-        ("Substâncias", get_compounds_map),
-        ("Laboratórios", get_laboratories_map),
-        ("Endereços", get_laboratories_with_address),
-    ]
+    results = {}
 
-    return loading_with_progress(tasks, "Carregando dados iniciais...")
+    # Funções que podem rodar em paralelo (não dependem umas das outras)
+    parallel_tasks = {
+        "Lotes": lambda: get_all_lots(start_date, end_date),
+        "Coletas": lambda: get_all_gatherings(start_date, end_date),
+        "Mapeamento de amostras": lambda: get_chain_to_sample_map(start_date, end_date),
+        "Dados RENACH": lambda: get_renach_data_cached(start_date, end_date),
+        "Substâncias": get_compounds_map,
+        "Laboratórios": get_laboratories_map,
+        "Endereços": get_laboratories_with_address,
+    }
+
+    total_tasks = len(parallel_tasks) + 1  # +1 para Resultados (depende de Lotes)
+    completed = 0
+
+    # Criar placeholder para progress (se não silent)
+    progress_placeholder = None
+    if not silent:
+        progress_placeholder = st.empty()
+        progress_placeholder.progress(0, text="Carregando dados iniciais...")
+
+    # Executar tarefas em paralelo
+    with ThreadPoolExecutor(max_workers=7) as executor:
+        futures = {executor.submit(func): name for name, func in parallel_tasks.items()}
+
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                results[name] = None
+                if not silent:
+                    st.error(f"Erro ao carregar {name}: {e}")
+
+            completed += 1
+            if progress_placeholder:
+                progress_placeholder.progress(
+                    completed / total_tasks,
+                    text=f"Carregando {name}..."
+                )
+
+    # Carregar Resultados DEPOIS de Lotes (depende de lotes para filtrar)
+    if progress_placeholder:
+        progress_placeholder.progress(
+            completed / total_tasks,
+            text="Carregando Resultados..."
+        )
+    try:
+        results["Resultados"] = get_all_results(start_date, end_date)
+    except Exception as e:
+        results["Resultados"] = None
+        if not silent:
+            st.error(f"Erro ao carregar Resultados: {e}")
+
+    completed += 1
+    if progress_placeholder:
+        progress_placeholder.progress(1.0, text="Dados carregados!")
+        time.sleep(0.3)
+        progress_placeholder.empty()
+
+    return results
 
 
 # ============================================
@@ -630,6 +728,53 @@ def get_compounds_map() -> dict:
     except Exception as e:
         st.error(f"Erro ao buscar compounds: {e}")
         return {}
+
+
+def get_compound_type_map() -> dict:
+    """
+    Retorna um mapeamento de compound ObjectID para tipo de substância.
+    Tipos: Ilícito, Medicamento, Psicoativo legal
+    """
+    return {
+        # Ilícito
+        "5cdf0e844040d61c3c496407": "Ilícito",  # 6-MAM (Heroína)
+        "5cdf0e844040d61c3c496408": "Ilícito",  # MDMA (Ecstasy)
+        "5cdf0e844040d61c3c496409": "Ilícito",  # MDA
+        "5cdf0e844040d61c3c49640a": "Ilícito",  # Anfetamina
+        "5cdf0e844040d61c3c49640b": "Ilícito",  # Metanfetamina
+        "5cdf0e844040d61c3c49640c": "Ilícito",  # THC
+        "5cdf0e844040d61c3c49640d": "Ilícito",  # Cocaína
+        "5cdf0e844040d61c3c49640e": "Ilícito",  # Benzoilecgonina
+        "5cdf0e844040d61c3c49640f": "Ilícito",  # Cocaetileno
+        "5cdf0e844040d61c3c496415": "Ilícito",  # Cetamina
+        # Medicamento
+        "5cdf0e844040d61c3c496410": "Medicamento",  # Codeína
+        "5cdf0e844040d61c3c496411": "Medicamento",  # Morfina
+        "5cdf0e844040d61c3c496412": "Medicamento",  # Tramadol
+        "5cdf0e844040d61c3c496413": "Medicamento",  # Fentanil
+        "5cdf0e844040d61c3c496414": "Medicamento",  # Metadona
+        "5cdf0e844040d61c3c496416": "Medicamento",  # Zolpidem
+    }
+
+
+def get_compounds_by_type(compound_type: str) -> list:
+    """
+    Retorna a lista de ObjectIDs de compounds de um determinado tipo.
+    compound_type: 'Ilícito', 'Medicamento', 'Psicoativo legal', ou 'Todos'
+    """
+    type_map = get_compound_type_map()
+    if compound_type == 'Todos':
+        return list(type_map.keys())
+    return [cid for cid, ctype in type_map.items() if ctype == compound_type]
+
+
+def get_compound_names_by_type(compound_type: str) -> list:
+    """
+    Retorna a lista de nomes de compounds de um determinado tipo.
+    """
+    compounds_map = get_compounds_map()
+    compound_ids = get_compounds_by_type(compound_type)
+    return [compounds_map.get(cid, 'Desconhecido') for cid in compound_ids if cid in compounds_map]
 
 
 @st.cache_data(ttl=3600)
@@ -1061,9 +1206,6 @@ def main():
     AuthManager.check_and_refresh_token(auth)
     create_user_header()
 
-    # Carregar dados base na primeira execução
-    load_base_data()
-
     # Sidebar - Navegação
     with st.sidebar:
         st.markdown("---")
@@ -1073,13 +1215,12 @@ def main():
 
         paginas = [
             "🏠 Visão Geral",
-            "👤 Perfil Demográfico",
-            "🧪 Substâncias",
             "🗺️ Mapa Geográfico",
             "📈 Análise Temporal",
             "📋 Tabela Detalhada",
             "🔍 Auditoria",
-            "🏢 Rede"
+            "🏢 Rede",
+            "👤 Perfil Demográfico"
         ]
 
         for pag in paginas:
@@ -1170,23 +1311,22 @@ def main():
                 st.session_state.base_data_loaded = False
                 st.rerun()
 
-    # Roteamento de páginas com loader customizado para evitar dimming
-    if pagina == "🏠 Visão Geral":
-        render_page_with_loading("Visão Geral", render_visao_geral)
-    elif pagina == "👤 Perfil Demográfico":
-        render_page_with_loading("Perfil Demográfico", render_perfil_demografico)
-    elif pagina == "🧪 Substâncias":
-        render_page_with_loading("Substâncias", render_substancias)
-    elif pagina == "🗺️ Mapa Geográfico":
-        render_page_with_loading("Mapa Geográfico", render_mapa)
-    elif pagina == "📈 Análise Temporal":
-        render_page_with_loading("Análise Temporal", render_temporal)
-    elif pagina == "📋 Tabela Detalhada":
-        render_page_with_loading("Tabela Detalhada", render_tabela_detalhada)
-    elif pagina == "🔍 Auditoria":
-        render_page_with_loading("Auditoria", render_auditoria)
-    elif pagina == "🏢 Rede":
-        render_page_with_loading("Rede", render_rede)
+    # Mapeamento de páginas
+    paginas_render = {
+        "🏠 Visão Geral": ("Visão Geral", render_visao_geral),
+        "👤 Perfil Demográfico": ("Perfil Demográfico", render_perfil_demografico),
+        "🧪 Substâncias": ("Substâncias", render_substancias),
+        "🗺️ Mapa Geográfico": ("Mapa Geográfico", render_mapa),
+        "📈 Análise Temporal": ("Análise Temporal", render_temporal),
+        "📋 Tabela Detalhada": ("Tabela Detalhada", render_tabela_detalhada),
+        "🔍 Auditoria": ("Auditoria", render_auditoria),
+        "🏢 Rede": ("Rede", render_rede),
+    }
+
+    # Renderizar página com carregamento unificado (dados + página em um único spinner)
+    if pagina in paginas_render:
+        page_name, render_func = paginas_render[pagina]
+        render_page_with_unified_loading(page_name, render_func)
 
 
 # ============================================
@@ -1404,6 +1544,413 @@ def get_substance_data() -> pd.DataFrame:
     except Exception as e:
         st.error(f"Erro ao buscar dados de substâncias: {e}")
         return pd.DataFrame()
+
+
+def get_substance_data_full(start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    """
+    Busca dados de substâncias para um período específico (sem usar sessão).
+    Usado para exportações com datas customizadas.
+    """
+    try:
+        # 1. Buscar lotes do período para criar mapeamento de tipo de análise
+        lots_collection = get_collection("lots")
+        lots_period = list(lots_collection.find(
+            {"createdAt": {"$gte": start_date, "$lte": end_date}},
+            {"code": 1, "analysisType": 1, "createdAt": 1, "_samples": 1}
+        ))
+
+        if not lots_period:
+            return pd.DataFrame()
+
+        # Criar mapeamentos de lote
+        lot_codes = []
+        lot_type_map = {}
+        lot_date_map = {}
+        lot_samples_map = {}
+        analysis_type_names = {
+            "screening": "Triagem",
+            "confirmatory": "Confirmatório",
+            "confirmatoryTHC": "Confirmatório THC"
+        }
+
+        all_sample_ids = []
+        for lot in lots_period:
+            code = lot.get('code')
+            if code:
+                lot_codes.append(code)
+                analysis_type = lot.get('analysisType', '')
+                lot_type_map[code] = analysis_type_names.get(analysis_type, analysis_type or 'N/A')
+                created_at = lot.get('createdAt')
+                if created_at:
+                    created_at_brt = created_at - timedelta(hours=3)
+                    lot_date_map[code] = created_at_brt.strftime('%d/%m/%Y')
+                else:
+                    lot_date_map[code] = 'N/A'
+                samples = lot.get('_samples', [])
+                if samples:
+                    lot_samples_map[code] = samples
+                    all_sample_ids.extend(samples)
+
+        # 1.1 Buscar gatherings para mapear chainOfCustody -> purpose.type e purpose.subType
+        client = get_mongo_client()
+        db = client["ctox"]
+        gatherings_collection = db["gatherings"]
+
+        unique_sample_ids = list(set(all_sample_ids))
+        gatherings = list(gatherings_collection.find(
+            {"_chainOfCustody": {"$in": unique_sample_ids}},
+            {"_chainOfCustody": 1, "purpose.type": 1, "purpose.subType": 1}
+        ))
+
+        chain_to_type = {}
+        chain_to_subtype = {}
+        for g in gatherings:
+            chain_id = g.get("_chainOfCustody")
+            purpose = g.get("purpose", {})
+            ptype = purpose.get("type", "") if purpose else ""
+            subtype = purpose.get("subType", "") if purpose else ""
+            if chain_id:
+                chain_to_type[chain_id] = ptype
+                chain_to_subtype[chain_id] = subtype
+
+        tipos_map = {
+            "cnh": "CNH",
+            "clt": "CLT",
+            "cltCnh": "CLT + CNH"
+        }
+
+        subtipos_map = {
+            "periodic": "Periódico",
+            "hiring": "Admissional",
+            "resignation": "Demissional",
+            "firstLicense": "Primeira Habilitação",
+            "firstCnh": "Primeira Habilitação",
+            "renovation": "Renovação",
+            "categoryChange": "Mudança de Categoria",
+            "functionChange": "Mudança de Função",
+            "return": "Retorno ao Trabalho"
+        }
+
+        lot_tipo_map = {}
+        lot_subtipo_map = {}
+        for lot_code, sample_ids in lot_samples_map.items():
+            ptype = ""
+            subtype = ""
+            for sample_id in sample_ids:
+                if sample_id in chain_to_type and chain_to_type[sample_id]:
+                    ptype = chain_to_type[sample_id]
+                    subtype = chain_to_subtype.get(sample_id, "")
+                    break
+            lot_tipo_map[lot_code] = tipos_map.get(ptype, ptype) if ptype else "N/A"
+            lot_subtipo_map[lot_code] = subtipos_map.get(subtype, subtype) if subtype else "N/A"
+
+        # 2. Aggregation pipeline no MongoDB
+        results_collection = db["results"]
+
+        pipeline = [
+            {"$match": {"_lot": {"$in": lot_codes}}},
+            {"$unwind": "$samples"},
+            {"$unwind": "$samples._compound"},
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "samples._compound._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
+            {"$unwind": "$compoundInfo"},
+            {
+                "$project": {
+                    "_lot": 1,
+                    "_sample": "$samples._sample",
+                    "samplePositive": "$samples.positive",
+                    "compoundName": "$compoundInfo.name",
+                    "compoundPositive": "$samples._compound.positive",
+                    "concentration": "$samples._compound.concentration"
+                }
+            }
+        ]
+
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
+
+        if not results:
+            return pd.DataFrame()
+
+        df_long = pd.DataFrame(results)
+
+        df_meta = df_long[['_lot', '_sample', 'samplePositive']].drop_duplicates()
+
+        df_pivot = df_long.pivot_table(
+            index='_sample',
+            columns='compoundName',
+            values='compoundPositive',
+            aggfunc='max'
+        ).reset_index()
+
+        compound_cols = [col for col in df_pivot.columns if col != '_sample']
+        for col in compound_cols:
+            df_pivot[col] = df_pivot[col].apply(lambda x: 'Positivo' if x == True else 'Negativo')
+
+        df_final = df_meta.merge(df_pivot, on='_sample', how='left')
+
+        df_final['Data'] = df_final['_lot'].map(lot_date_map).fillna('N/A')
+        df_final['Tipo de Lote'] = df_final['_lot'].map(lot_type_map).fillna('N/A')
+        df_final['Tipo Exame'] = df_final['_lot'].map(lot_tipo_map).fillna('N/A')
+        df_final['Subfinalidade'] = df_final['_lot'].map(lot_subtipo_map).fillna('N/A')
+
+        df_final = df_final.rename(columns={'_lot': 'Lote', '_sample': 'Amostra'})
+
+        first_cols = ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']
+        other_cols = [col for col in df_final.columns if col not in first_cols and col != 'samplePositive']
+        df_final = df_final[first_cols + sorted(other_cols)]
+
+        return df_final
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados de substâncias (período completo): {e}")
+        return pd.DataFrame()
+
+
+def get_substance_data_paginated(page: int = 1, page_size: int = 100, filters: dict = None) -> tuple:
+    """
+    Busca dados de substâncias com paginação server-side.
+
+    Args:
+        page: Número da página (começa em 1)
+        page_size: Quantidade de registros por página
+        filters: Dicionário com filtros opcionais {
+            'tipo_lote': str,
+            'tipo_exame': str,
+            'subfinalidade': str,
+            'resultado': str  # 'Positivo' ou 'Negativo'
+        }
+
+    Returns:
+        Tuple (df: DataFrame, total_count: int, total_pages: int)
+    """
+    start_date, end_date = get_selected_period()
+
+    try:
+        # 1. Buscar lotes do período para criar mapeamento de tipo de análise
+        lots_collection = get_collection("lots")
+        lots_period = list(lots_collection.find(
+            {"createdAt": {"$gte": start_date, "$lte": end_date}},
+            {"code": 1, "analysisType": 1, "createdAt": 1, "_samples": 1}
+        ))
+
+        if not lots_period:
+            return pd.DataFrame(), 0, 0
+
+        # Criar mapeamentos de lote
+        lot_codes = []
+        lot_type_map = {}
+        lot_date_map = {}
+        lot_samples_map = {}
+        analysis_type_names = {
+            "screening": "Triagem",
+            "confirmatory": "Confirmatório",
+            "confirmatoryTHC": "Confirmatório THC"
+        }
+
+        all_sample_ids = []
+        for lot in lots_period:
+            code = lot.get('code')
+            if code:
+                lot_codes.append(code)
+                analysis_type = lot.get('analysisType', '')
+                lot_type_map[code] = analysis_type_names.get(analysis_type, analysis_type or 'N/A')
+                created_at = lot.get('createdAt')
+                if created_at:
+                    created_at_brt = created_at - timedelta(hours=3)
+                    lot_date_map[code] = created_at_brt.strftime('%d/%m/%Y')
+                else:
+                    lot_date_map[code] = 'N/A'
+                samples = lot.get('_samples', [])
+                if samples:
+                    lot_samples_map[code] = samples
+                    all_sample_ids.extend(samples)
+
+        # 1.1 Buscar gatherings para mapear chainOfCustody -> purpose.type e purpose.subType
+        client = get_mongo_client()
+        db = client["ctox"]
+        gatherings_collection = db["gatherings"]
+
+        unique_sample_ids = list(set(all_sample_ids))
+        gatherings = list(gatherings_collection.find(
+            {"_chainOfCustody": {"$in": unique_sample_ids}},
+            {"_chainOfCustody": 1, "purpose.type": 1, "purpose.subType": 1}
+        ))
+
+        chain_to_type = {}
+        chain_to_subtype = {}
+        for g in gatherings:
+            chain_id = g.get("_chainOfCustody")
+            purpose = g.get("purpose", {})
+            ptype = purpose.get("type", "") if purpose else ""
+            subtype = purpose.get("subType", "") if purpose else ""
+            if chain_id:
+                chain_to_type[chain_id] = ptype
+                chain_to_subtype[chain_id] = subtype
+
+        # Mapeamentos para tradução
+        tipos_map = {
+            "cnh": "CNH",
+            "clt": "CLT",
+            "cltCnh": "CLT + CNH"
+        }
+
+        subtipos_map = {
+            "periodic": "Periódico",
+            "hiring": "Admissional",
+            "resignation": "Demissional",
+            "firstLicense": "Primeira Habilitação",
+            "firstCnh": "Primeira Habilitação",
+            "renovation": "Renovação",
+            "categoryChange": "Mudança de Categoria",
+            "functionChange": "Mudança de Função",
+            "return": "Retorno ao Trabalho",
+            "againstProof": "Contra Prova"
+        }
+
+        lot_tipo_map = {}
+        lot_subtipo_map = {}
+        for lot_code, sample_ids in lot_samples_map.items():
+            ptype = ""
+            subtype = ""
+            for sample_id in sample_ids:
+                if sample_id in chain_to_type and chain_to_type[sample_id]:
+                    ptype = chain_to_type[sample_id]
+                    subtype = chain_to_subtype.get(sample_id, "")
+                    break
+            lot_tipo_map[lot_code] = tipos_map.get(ptype, ptype) if ptype else "N/A"
+            lot_subtipo_map[lot_code] = subtipos_map.get(subtype, subtype) if subtype else "N/A"
+
+        # Aplicar filtros de lote se necessário
+        filtered_lot_codes = lot_codes
+        if filters:
+            if filters.get('tipo_lote') and filters['tipo_lote'] != 'Todos':
+                filtered_lot_codes = [c for c in filtered_lot_codes if lot_type_map.get(c) == filters['tipo_lote']]
+            if filters.get('tipo_exame') and filters['tipo_exame'] != 'Todos':
+                filtered_lot_codes = [c for c in filtered_lot_codes if lot_tipo_map.get(c) == filters['tipo_exame']]
+            if filters.get('subfinalidade') and filters['subfinalidade'] != 'Todos':
+                filtered_lot_codes = [c for c in filtered_lot_codes if lot_subtipo_map.get(c) == filters['subfinalidade']]
+
+        if not filtered_lot_codes:
+            return pd.DataFrame(), 0, 0
+
+        # 2. Pipeline com contagem total
+        results_collection = db["results"]
+
+        # Pipeline base para contagem
+        match_stage = {"$match": {"_lot": {"$in": filtered_lot_codes}}}
+
+        # Contar total de amostras únicas
+        count_pipeline = [
+            match_stage,
+            {"$unwind": "$samples"},
+            {"$group": {"_id": "$samples._sample"}},
+            {"$count": "total"}
+        ]
+
+        count_result = list(results_collection.aggregate(count_pipeline, allowDiskUse=True))
+        total_count = count_result[0]['total'] if count_result else 0
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 0
+
+        if total_count == 0:
+            return pd.DataFrame(), 0, 0
+
+        # Pipeline com paginação
+        skip = (page - 1) * page_size
+
+        pipeline = [
+            match_stage,
+            {"$unwind": "$samples"},
+            {"$group": {
+                "_id": "$samples._sample",
+                "_lot": {"$first": "$_lot"},
+                "samplePositive": {"$first": "$samples.positive"},
+                "compounds": {"$first": "$samples._compound"}
+            }},
+            {"$sort": {"_lot": 1, "_id": 1}},
+            {"$skip": skip},
+            {"$limit": page_size},
+            {"$unwind": "$compounds"},
+            {
+                "$lookup": {
+                    "from": "compounds",
+                    "localField": "compounds._id",
+                    "foreignField": "_id",
+                    "as": "compoundInfo"
+                }
+            },
+            {"$unwind": "$compoundInfo"},
+            {
+                "$project": {
+                    "_lot": 1,
+                    "_sample": "$_id",
+                    "samplePositive": 1,
+                    "compoundName": "$compoundInfo.name",
+                    "compoundPositive": "$compounds.positive",
+                    "concentration": "$compounds.concentration"
+                }
+            }
+        ]
+
+        results = list(results_collection.aggregate(pipeline, allowDiskUse=True))
+
+        if not results:
+            return pd.DataFrame(), total_count, total_pages
+
+        # 3. Converter para DataFrame no formato "long"
+        df_long = pd.DataFrame(results)
+
+        # 4. Pivotar para ter cada compound como coluna
+        df_meta = df_long[['_lot', '_sample', 'samplePositive']].drop_duplicates()
+
+        df_pivot = df_long.pivot_table(
+            index='_sample',
+            columns='compoundName',
+            values='compoundPositive',
+            aggfunc='max'
+        ).reset_index()
+
+        # Converter True/False para "Positivo"/"Negativo"
+        compound_cols = [col for col in df_pivot.columns if col != '_sample']
+        for col in compound_cols:
+            df_pivot[col] = df_pivot[col].apply(lambda x: 'Positivo' if x == True else 'Negativo')
+
+        # 5. Juntar metadados com dados pivotados
+        df_final = df_meta.merge(df_pivot, on='_sample', how='left')
+
+        # 6. Adicionar colunas de Data, Tipo de Lote, Tipo Exame e Subfinalidade
+        df_final['Data'] = df_final['_lot'].map(lot_date_map).fillna('N/A')
+        df_final['Tipo de Lote'] = df_final['_lot'].map(lot_type_map).fillna('N/A')
+        df_final['Tipo Exame'] = df_final['_lot'].map(lot_tipo_map).fillna('N/A')
+        df_final['Subfinalidade'] = df_final['_lot'].map(lot_subtipo_map).fillna('N/A')
+
+        # 7. Renomear e reorganizar colunas
+        df_final = df_final.rename(columns={'_lot': 'Lote', '_sample': 'Amostra'})
+
+        first_cols = ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']
+        other_cols = [col for col in df_final.columns if col not in first_cols and col != 'samplePositive']
+        df_final = df_final[first_cols + sorted(other_cols)]
+
+        # Aplicar filtro de resultado se necessário
+        if filters and filters.get('resultado') and filters['resultado'] != 'Todos':
+            # Verificar se alguma substância é positiva
+            substance_cols = [c for c in df_final.columns if c not in first_cols]
+            if filters['resultado'] == 'Positivo':
+                mask = df_final[substance_cols].apply(lambda row: any(v == 'Positivo' for v in row), axis=1)
+            else:
+                mask = df_final[substance_cols].apply(lambda row: all(v == 'Negativo' for v in row), axis=1)
+            df_final = df_final[mask]
+
+        return df_final, total_count, total_pages
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados paginados: {e}")
+        return pd.DataFrame(), 0, 0
 
 
 def get_sample_concentration_data(sample_code: str) -> dict:
@@ -1660,12 +2207,26 @@ def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
         lots_collection = db["lots"]
         gatherings_collection = db["gatherings"]
 
+        # Converter laboratory_id para ObjectId
+        try:
+            lab_oid = ObjectId(laboratory_id)
+        except Exception:
+            return {}
+
         # 1. Buscar gatherings do laboratório para pegar os chainOfCustody
         lab_gatherings = list(gatherings_collection.find(
-            {"_laboratory": ObjectId(laboratory_id)},
+            {"_laboratory": lab_oid},
             {"_chainOfCustody": 1}
         ))
         chain_ids = [g.get("_chainOfCustody") for g in lab_gatherings if g.get("_chainOfCustody")]
+
+        if not chain_ids:
+            # Tentar buscar também por string do laboratory_id (alguns documentos podem ter string)
+            lab_gatherings = list(gatherings_collection.find(
+                {"_laboratory": laboratory_id},
+                {"_chainOfCustody": 1}
+            ))
+            chain_ids = [g.get("_chainOfCustody") for g in lab_gatherings if g.get("_chainOfCustody")]
 
         if not chain_ids:
             return {}
@@ -1909,7 +2470,8 @@ def get_renach_data(laboratory_id: str = None, month: int = None, purpose_type: 
 
 def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict:
     """
-    Busca contagem de amostras por finalidade - USA DADOS PRÉ-CARREGADOS (últimos 30 dias).
+    Busca contagem de amostras por finalidade - USA DADOS PRÉ-CARREGADOS.
+    Conta apenas amostras que têm resultados processados (consistente com outras métricas).
     """
     cache_key = generate_cache_key("samples_purpose", laboratory_id, month)
     cached = get_cached_data("samples_purpose_data", cache_key)
@@ -1920,9 +2482,11 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
         # Usar dados pré-carregados com período selecionado
         start_date, end_date = get_selected_period()
         gatherings_data = get_all_gatherings(start_date, end_date)
+        lots_dict = get_all_lots(start_date, end_date)
+        results_dict = get_all_results(start_date, end_date)
+
         chain_to_lab = gatherings_data.get("chain_to_lab", {})
         chain_to_purpose = gatherings_data.get("chain_to_purpose", {})
-        chain_to_date = gatherings_data.get("chain_to_date", {})
 
         # Calcular período do mês se especificado
         month_start = None
@@ -1948,21 +2512,34 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
             "resignation": "Demissão"
         }
 
+        # Coletar chain_ids que têm resultados (apenas triagem para não duplicar)
+        chains_com_resultados = set()
+        for lot_code, lot_data in lots_dict.items():
+            # Apenas triagem para não contar a mesma amostra múltiplas vezes
+            if lot_data.get("analysisType") != "screening":
+                continue
+
+            # Filtrar por mês
+            if month and lot_data.get("month") != month:
+                continue
+
+            # Pegar as chains deste lote que têm resultados
+            lot_samples = lot_data.get("_samples", set())
+            lot_results = results_dict.get(lot_code, [])
+
+            if lot_results:
+                chains_com_resultados.update(lot_samples)
+
         purpose_counts = {}
 
-        for chain_id, purpose_type in chain_to_purpose.items():
+        for chain_id in chains_com_resultados:
+            purpose_type = chain_to_purpose.get(chain_id, "")
+
             # Filtrar por laboratório
             if laboratory_id:
                 lab_id = chain_to_lab.get(chain_id)
                 if lab_id != laboratory_id:
                     continue
-
-            # Filtrar por mês se especificado
-            if month_start and month_end:
-                chain_date = chain_to_date.get(chain_id)
-                if chain_date:
-                    if chain_date < month_start or chain_date > month_end:
-                        continue
 
             purpose_name = purpose_names.get(purpose_type, purpose_type or 'Não informado')
 
@@ -1978,13 +2555,115 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
         return {}
 
 
+def get_samples_by_subtype(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+    """
+    Busca contagem de amostras por subfinalidade (purpose.subType) - USA DADOS PRÉ-CARREGADOS.
+    Conta apenas amostras que têm resultados processados (consistente com outras métricas).
+    """
+    cache_key = generate_cache_key("samples_subtype", laboratory_id, month, purpose_type)
+    cached = get_cached_data("samples_subtype_data", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        # Usar dados pré-carregados com período selecionado
+        start_date, end_date = get_selected_period()
+        gatherings_data = get_all_gatherings(start_date, end_date)
+        lots_dict = get_all_lots(start_date, end_date)
+        results_dict = get_all_results(start_date, end_date)
+
+        chain_to_lab = gatherings_data.get("chain_to_lab", {})
+        chain_to_purpose = gatherings_data.get("chain_to_purpose", {})
+        chain_to_subtype = gatherings_data.get("chain_to_subtype", {})
+
+        # Calcular período do mês se especificado
+        month_start = None
+        month_end = None
+        if month:
+            year = datetime.now().year
+            month_start = datetime(year, month, 1)
+            if month == 12:
+                month_end = datetime(year, 12, 31, 23, 59, 59)
+            else:
+                month_end = datetime(year, month + 1, 1) - timedelta(seconds=1)
+
+        # Mapear tipos de subfinalidade para nomes legíveis
+        subtype_names = {
+            "periodic": "Periódico",
+            "categoryChange": "Mudança de Categoria",
+            "hiring": "Admissão",
+            "renovation": "Renovação",
+            "resignation": "Demissão",
+            "returnToWork": "Retorno ao Trabalho",
+            "return": "Retorno ao Trabalho",
+            "functionChange": "Mudança de Função",
+            "firstLicense": "Primeira Habilitação",
+            "random": "Aleatório",
+            "postAccident": "Pós-Acidente",
+            "reasonableCause": "Causa Razoável",
+            "followUp": "Acompanhamento",
+            "preEmployment": "Pré-Admissão"
+        }
+
+        # Coletar chain_ids que têm resultados (apenas triagem para não duplicar)
+        chains_com_resultados = set()
+        for lot_code, lot_data in lots_dict.items():
+            # Apenas triagem para não contar a mesma amostra múltiplas vezes
+            if lot_data.get("analysisType") != "screening":
+                continue
+
+            # Filtrar por mês
+            if month and lot_data.get("month") != month:
+                continue
+
+            # Pegar as chains deste lote que têm resultados
+            lot_samples = lot_data.get("_samples", set())
+            lot_results = results_dict.get(lot_code, [])
+
+            if lot_results:
+                chains_com_resultados.update(lot_samples)
+
+        subtype_counts = {}
+
+        for chain_id in chains_com_resultados:
+            # Verificar se tem subtype
+            subtype = chain_to_subtype.get(chain_id)
+            if not subtype:
+                subtype = ""
+
+            # Filtrar por laboratório
+            if laboratory_id:
+                lab_id = chain_to_lab.get(chain_id)
+                if lab_id != laboratory_id:
+                    continue
+
+            # Filtrar por finalidade (purpose.type)
+            if purpose_type:
+                chain_purpose = chain_to_purpose.get(chain_id)
+                if chain_purpose != purpose_type:
+                    continue
+
+            subtype_name = subtype_names.get(subtype, subtype or 'Não informado')
+
+            if subtype_name not in subtype_counts:
+                subtype_counts[subtype_name] = 0
+            subtype_counts[subtype_name] += 1
+
+        set_cached_data("samples_subtype_data", cache_key, subtype_counts)
+        return subtype_counts
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados por subfinalidade: {e}")
+        return {}
+
+
 def render_visao_geral():
     st.title("🏠 Visão Geral")
 
     # Filtros
     st.markdown("### 🔍 Filtros")
 
-    col_filtro1, col_filtro2 = st.columns(2)
+    col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
 
     # Filtro de Finalidade
     with col_filtro1:
@@ -1998,12 +2677,72 @@ def render_visao_geral():
         selected_finalidade_name = st.selectbox(
             "Finalidade da Amostra",
             options=list(finalidades.keys()),
-            index=0
+            index=0,
+            key="visao_geral_finalidade"
         )
         selected_purpose = finalidades[selected_finalidade_name]
 
-    # Filtro de Laboratório por CNPJ - MÚLTIPLA SELEÇÃO
+    # Filtro de Subfinalidade
     with col_filtro2:
+        # Subfinalidades dependem da finalidade selecionada
+        subfinalidades_por_finalidade = {
+            "Todas": {
+                "Todas": None,
+                "Periódico": "periodic",
+                "Admissão": "hiring",
+                "Demissão": "resignation",
+                "Mudança de Categoria": "categoryChange",
+                "Renovação": "renovation",
+                "Retorno ao Trabalho": "returnToWork",
+                "Aleatório": "random",
+                "Pós-Acidente": "postAccident",
+                "Causa Razoável": "reasonableCause",
+                "Acompanhamento": "followUp",
+                "Pré-Admissão": "preEmployment"
+            },
+            "CLT": {
+                "Todas": None,
+                "Periódico": "periodic",
+                "Admissão": "hiring",
+                "Demissão": "resignation",
+                "Mudança de Categoria": "categoryChange",
+                "Retorno ao Trabalho": "returnToWork",
+                "Aleatório": "random",
+                "Pós-Acidente": "postAccident",
+                "Causa Razoável": "reasonableCause",
+                "Acompanhamento": "followUp"
+            },
+            "CLT + CNH": {
+                "Todas": None,
+                "Periódico": "periodic",
+                "Admissão": "hiring",
+                "Demissão": "resignation",
+                "Mudança de Categoria": "categoryChange",
+                "Retorno ao Trabalho": "returnToWork",
+                "Aleatório": "random",
+                "Pós-Acidente": "postAccident",
+                "Causa Razoável": "reasonableCause",
+                "Acompanhamento": "followUp"
+            },
+            "Concurso Público": {
+                "Todas": None,
+                "Pré-Admissão": "preEmployment"
+            },
+            "Contra Prova": {
+                "Todas": None
+            }
+        }
+        subfinalidades_disponiveis = subfinalidades_por_finalidade.get(selected_finalidade_name, {"Todas": None})
+        selected_subfinalidade_name = st.selectbox(
+            "Subfinalidade",
+            options=list(subfinalidades_disponiveis.keys()),
+            index=0,
+            key="visao_geral_subfinalidade"
+        )
+        selected_subtype = subfinalidades_disponiveis[selected_subfinalidade_name]
+
+    # Filtro de Laboratório por CNPJ - MÚLTIPLA SELEÇÃO
+    with col_filtro3:
         labs_by_cnpj = get_laboratories_by_cnpj()
         cnpj_options = sorted(labs_by_cnpj.keys())
 
@@ -2011,7 +2750,8 @@ def render_visao_geral():
             "CNPJ Laboratórios (PCL)",
             options=cnpj_options,
             default=[],
-            placeholder="Todos os laboratórios"
+            placeholder="Todos os laboratórios",
+            key="visao_geral_cnpjs"
         )
 
         # Converter CNPJs selecionados para lista de lab_ids
@@ -2280,6 +3020,87 @@ def render_visao_geral():
 
         st.dataframe(df_display, use_container_width=True, hide_index=True)
 
+        st.markdown("---")
+
+        # ========== GRÁFICO DE SUBFINALIDADE (AGREGADO) ==========
+        st.markdown("### 📌 Amostras por Subfinalidade (Agregado)")
+
+        # Agregar subfinalidades de todos os CNPJs selecionados
+        subtype_data_agregado = {}
+        for cnpj in selected_cnpjs:
+            lab_id = labs_by_cnpj[cnpj]["id"]
+            subtype_data_lab = get_samples_by_subtype(lab_id, None, selected_purpose)
+            for sub_name, sub_count in subtype_data_lab.items():
+                if sub_name not in subtype_data_agregado:
+                    subtype_data_agregado[sub_name] = 0
+                subtype_data_agregado[sub_name] += sub_count
+
+        if subtype_data_agregado:
+            sorted_subtypes = sorted(subtype_data_agregado.items(), key=lambda x: x[1], reverse=True)
+            subfinalidades_lista = [s[0] for s in sorted_subtypes]
+            quantidades_sub = [s[1] for s in sorted_subtypes]
+            total_subfinalidade = sum(quantidades_sub)
+
+            df_subtype = pd.DataFrame({
+                'Subfinalidade': subfinalidades_lista,
+                'Quantidade': quantidades_sub
+            })
+
+            df_subtype['Percentual'] = (df_subtype['Quantidade'] / total_subfinalidade * 100).round(2)
+            df_subtype['Texto'] = df_subtype.apply(
+                lambda row: f"{row['Quantidade']:,} ({row['Percentual']:.1f}%)".replace(",", "."), axis=1
+            )
+
+            max_qtd_sub = df_subtype['Quantidade'].max()
+
+            cores_subfinalidades = {
+                'Periódico': '#00CED1',
+                'Admissão': '#4169E1',
+                'Demissão': '#FF6B6B',
+                'Mudança de Categoria': '#9370DB',
+                'Renovação': '#FFD700',
+                'Retorno ao Trabalho': '#32CD32',
+                'Aleatório': '#FF8C00',
+                'Pós-Acidente': '#DC143C',
+                'Causa Razoável': '#8B4513',
+                'Acompanhamento': '#20B2AA',
+                'Pré-Admissão': '#6495ED',
+                'Não informado': '#888888'
+            }
+
+            df_subtype['Cor'] = df_subtype['Subfinalidade'].map(
+                lambda x: cores_subfinalidades.get(x, '#00CED1')
+            )
+
+            fig_subtype = go.Figure()
+
+            fig_subtype.add_trace(go.Bar(
+                y=df_subtype['Subfinalidade'],
+                x=df_subtype['Quantidade'],
+                orientation='h',
+                text=df_subtype['Texto'],
+                textposition='outside',
+                textfont=dict(size=10),
+                marker_color=df_subtype['Cor']
+            ))
+
+            fig_subtype.update_layout(
+                showlegend=False,
+                height=max(300, len(df_subtype) * 40),
+                margin=dict(t=20, b=30, l=120, r=120),
+                xaxis_title="",
+                yaxis_title="",
+                xaxis=dict(range=[0, max_qtd_sub * 1.3], showticklabels=False, showgrid=False),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)'
+            )
+
+            st.plotly_chart(fig_subtype, use_container_width=True, key="chart_visao_subfinalidade_multi")
+
+
+        else:
+            st.warning("Nenhum dado de subfinalidade encontrado")
+
     else:
         # ========== MODO NORMAL: UM OU NENHUM CNPJ ==========
         # Carregar dados com progress bar
@@ -2291,6 +3112,7 @@ def render_visao_geral():
             ("Confirmatório THC", get_confirmatorio_thc_data, (first_lab_id, None, selected_purpose)),
             ("RENACH", get_renach_data, (first_lab_id, None, selected_purpose)),
             ("Finalidades", get_samples_by_purpose, (first_lab_id, None)),
+            ("Subfinalidades", get_samples_by_subtype, (first_lab_id, None, selected_purpose)),
         ]
         data = loading_with_progress(tasks, "Carregando visão geral...")
         triagem_data = data["Triagem"]
@@ -2298,6 +3120,7 @@ def render_visao_geral():
         confirmatorio_thc_data = data["Confirmatório THC"]
         renach_data = data["RENACH"]
         purpose_data = data["Finalidades"]
+        subtype_data = data["Subfinalidades"]
 
         # Calcular métricas
         total_triagem = triagem_data["positivo"] + triagem_data["negativo"]
@@ -2571,6 +3394,103 @@ def render_visao_geral():
                 st.plotly_chart(fig_purpose, use_container_width=True, key="chart_visao_finalidade")
             else:
                 st.warning("Nenhum dado de finalidade encontrado")
+
+        st.markdown("---")
+
+        # ========== GRÁFICO DE SUBFINALIDADE ==========
+        st.markdown("### 📌 Amostras por Subfinalidade")
+
+        if subtype_data:
+            # Filtrar pelo subtype selecionado se houver
+            if selected_subtype:
+                # Mapear de volta para nome legível
+                subtype_names_inv = {
+                    "periodic": "Periódico",
+                    "categoryChange": "Mudança de Categoria",
+                    "hiring": "Admissão",
+                    "renovation": "Renovação",
+                    "resignation": "Demissão",
+                    "returnToWork": "Retorno ao Trabalho",
+                    "random": "Aleatório",
+                    "postAccident": "Pós-Acidente",
+                    "reasonableCause": "Causa Razoável",
+                    "followUp": "Acompanhamento",
+                    "preEmployment": "Pré-Admissão"
+                }
+                selected_subtype_name = subtype_names_inv.get(selected_subtype, selected_subtype)
+                if selected_subtype_name in subtype_data:
+                    subtype_data_filtered = {selected_subtype_name: subtype_data[selected_subtype_name]}
+                else:
+                    subtype_data_filtered = subtype_data
+            else:
+                subtype_data_filtered = subtype_data
+
+            sorted_subtypes = sorted(subtype_data_filtered.items(), key=lambda x: x[1], reverse=True)
+            subfinalidades_lista = [s[0] for s in sorted_subtypes]
+            quantidades_sub = [s[1] for s in sorted_subtypes]
+            total_subfinalidade = sum(quantidades_sub)
+
+            df_subtype = pd.DataFrame({
+                'Subfinalidade': subfinalidades_lista,
+                'Quantidade': quantidades_sub
+            })
+
+            df_subtype['Percentual'] = (df_subtype['Quantidade'] / total_subfinalidade * 100).round(2)
+            df_subtype['Texto'] = df_subtype.apply(
+                lambda row: f"{row['Quantidade']:,} ({row['Percentual']:.1f}%)".replace(",", "."), axis=1
+            )
+
+            max_qtd_sub = df_subtype['Quantidade'].max()
+
+            # Definir cores para diferentes subfinalidades
+            cores_subfinalidades = {
+                'Periódico': '#00CED1',
+                'Admissão': '#4169E1',
+                'Demissão': '#FF6B6B',
+                'Mudança de Categoria': '#9370DB',
+                'Renovação': '#FFD700',
+                'Retorno ao Trabalho': '#32CD32',
+                'Aleatório': '#FF8C00',
+                'Pós-Acidente': '#DC143C',
+                'Causa Razoável': '#8B4513',
+                'Acompanhamento': '#20B2AA',
+                'Pré-Admissão': '#6495ED',
+                'Não informado': '#888888'
+            }
+
+            df_subtype['Cor'] = df_subtype['Subfinalidade'].map(
+                lambda x: cores_subfinalidades.get(x, '#00CED1')
+            )
+
+            fig_subtype = go.Figure()
+
+            fig_subtype.add_trace(go.Bar(
+                y=df_subtype['Subfinalidade'],
+                x=df_subtype['Quantidade'],
+                orientation='h',
+                text=df_subtype['Texto'],
+                textposition='outside',
+                textfont=dict(size=10),
+                marker_color=df_subtype['Cor']
+            ))
+
+            fig_subtype.update_layout(
+                showlegend=False,
+                height=max(300, len(df_subtype) * 40),
+                margin=dict(t=20, b=30, l=120, r=120),
+                xaxis_title="",
+                yaxis_title="",
+                xaxis=dict(range=[0, max_qtd_sub * 1.3], showticklabels=False, showgrid=False),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)'
+            )
+
+            st.plotly_chart(fig_subtype, use_container_width=True, key="chart_visao_subfinalidade")
+
+            # Mostrar resumo em texto
+            st.caption(f"Total: {total_subfinalidade:,} amostras em {len(df_subtype)} subfinalidades".replace(",", "."))
+        else:
+            st.warning("Nenhum dado de subfinalidade encontrado para os filtros selecionados")
 
 
 def render_perfil_demografico():
@@ -5351,6 +6271,53 @@ def render_mapa():
 
     st.markdown("---")
 
+    # ========== TOP 5 SUBSTÂNCIAS COM MAIOR TAXA DE POSITIVIDADE ==========
+    st.subheader("🧪 Top 5 Substâncias - Taxa de Positividade")
+
+    # Buscar dados de positividade por substância
+    start_date, end_date = get_selected_period()
+    lab_ids = [selected_lab_id] if selected_lab_id else None
+    substance_data = get_positivity_by_substance(lab_ids, start_date, end_date)
+
+    if substance_data:
+        # Converter para DataFrame e ordenar por taxa de positividade
+        df_substances = pd.DataFrame([
+            {
+                "Substância": name,
+                "Positivos": data["positivo"],
+                "Total": data["total"],
+                "Taxa (%)": data["percentual"]
+            }
+            for name, data in substance_data.items()
+            if data["total"] > 0
+        ])
+
+        if not df_substances.empty:
+            # Ordenar por taxa de positividade (maior para menor) e pegar top 5
+            df_top5 = df_substances.sort_values("Taxa (%)", ascending=False).head(5)
+
+            # Exibir como cards horizontais
+            cols = st.columns(5)
+            for i, (idx, row) in enumerate(df_top5.iterrows()):
+                with cols[i]:
+                    taxa = row["Taxa (%)"]
+                    cor_taxa = "#FF6B6B" if taxa > 5 else "#FFD700" if taxa > 2 else "#00CED1"
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                                padding: 12px; border-radius: 10px; text-align: center; min-height: 110px;">
+                        <p style="color: #888; margin: 0; font-size: 11px; font-weight: bold;">#{i+1}</p>
+                        <p style="color: #FAFAFA; margin: 5px 0; font-size: 13px; font-weight: 600;">{row['Substância']}</p>
+                        <h3 style="color: {cor_taxa}; margin: 5px 0; font-size: 22px;">{taxa:.2f}%</h3>
+                        <p style="color: #888; margin: 0; font-size: 10px;">{row['Positivos']:,} / {row['Total']:,}</p>
+                    </div>
+                    """.replace(",", "."), unsafe_allow_html=True)
+        else:
+            st.info("Nenhum dado de substância disponível para o período selecionado.")
+    else:
+        st.info("Nenhum dado de substância disponível para o período selecionado.")
+
+    st.markdown("---")
+
     # Mapa Choropleth do Brasil
     st.subheader("🗺️ Distribuição Geográfica - Taxa de Positividade por Estado")
 
@@ -5809,18 +6776,20 @@ def render_temporal():
     with col1:
         st.markdown(f"""
         <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 15px; border-radius: 10px; text-align: center;">
+                    padding: 15px; border-radius: 10px; text-align: center; min-height: 95px; display: flex; flex-direction: column; justify-content: center;">
             <p style="color: #888; margin: 0; font-size: 12px;">Total no Período</p>
             <h2 style="color: #00CED1; margin: 5px 0; font-size: 24px;">{total_geral:,}</h2>
+            <p style="color: transparent; margin: 0; font-size: 11px;">&nbsp;</p>
         </div>
         """.replace(",", "."), unsafe_allow_html=True)
 
     with col2:
         st.markdown(f"""
         <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 15px; border-radius: 10px; text-align: center;">
+                    padding: 15px; border-radius: 10px; text-align: center; min-height: 95px; display: flex; flex-direction: column; justify-content: center;">
             <p style="color: #888; margin: 0; font-size: 12px;">Taxa Média</p>
             <h2 style="color: {'#FF6B6B' if taxa_media > 5 else '#FFD700' if taxa_media > 2 else '#00CED1'}; margin: 5px 0; font-size: 24px;">{taxa_media:.2f}%</h2>
+            <p style="color: transparent; margin: 0; font-size: 11px;">&nbsp;</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -5829,7 +6798,7 @@ def render_temporal():
         seta = "↑" if variacao_taxa > 0 else "↓" if variacao_taxa < 0 else "→"
         st.markdown(f"""
         <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 15px; border-radius: 10px; text-align: center;">
+                    padding: 15px; border-radius: 10px; text-align: center; min-height: 95px; display: flex; flex-direction: column; justify-content: center;">
             <p style="color: #888; margin: 0; font-size: 12px;">Taxa Último Período</p>
             <h2 style="color: {cor_variacao}; margin: 5px 0; font-size: 24px;">{taxa_atual:.2f}%</h2>
             <p style="color: {cor_variacao}; margin: 0; font-size: 11px;">{seta} {abs(variacao_taxa):.2f}pp vs anterior</p>
@@ -5841,7 +6810,7 @@ def render_temporal():
         seta_total = "↑" if variacao_total > 0 else "↓" if variacao_total < 0 else "→"
         st.markdown(f"""
         <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 15px; border-radius: 10px; text-align: center;">
+                    padding: 15px; border-radius: 10px; text-align: center; min-height: 95px; display: flex; flex-direction: column; justify-content: center;">
             <p style="color: #888; margin: 0; font-size: 12px;">Volume Último Período</p>
             <h2 style="color: #00CED1; margin: 5px 0; font-size: 24px;">{int(total_atual):,}</h2>
             <p style="color: {cor_var_total}; margin: 0; font-size: 11px;">{seta_total} {abs(variacao_total):.1f}% vs anterior</p>
@@ -6046,9 +7015,15 @@ def get_weekly_data(laboratory_ids: list = None, analysis_type: str = "screening
 
 def render_tabela_detalhada():
     """
-    Página 5 - Tabela Detalhada com Exportação
+    Página 5 - Tabela Detalhada com Exportação e Paginação Server-Side
     """
     st.title("📋 Tabela Detalhada")
+
+    # Inicializar estado de paginação
+    if 'tabela_page' not in st.session_state:
+        st.session_state.tabela_page = 1
+    if 'tabela_page_size' not in st.session_state:
+        st.session_state.tabela_page_size = 100
 
     # Filtros
     st.markdown("### 🔍 Filtros")
@@ -6070,8 +7045,8 @@ def render_tabela_detalhada():
         substancias_opcoes = ['Todas'] + list(compounds_map.values())
         filtro_substancia = st.selectbox("Substância Positiva", substancias_opcoes, key="det_substancia")
 
-    # Segunda linha: Filtros em cascata de Finalidade
-    col_tipo, col_sub = st.columns(2)
+    # Segunda linha: Filtros em cascata de Finalidade e Tipo de Substância
+    col_tipo, col_sub, col_tipo_subst = st.columns(3)
 
     with col_tipo:
         # Tipo de Exame (CNH, CLT, CLT + CNH)
@@ -6080,51 +7055,69 @@ def render_tabela_detalhada():
 
     with col_sub:
         # Subfinalidades dependem do tipo selecionado
-        # Mapeamento de quais subfinalidades pertencem a cada tipo
         subfinalidades_por_tipo = {
-            "CNH": ["Todas", "Primeira Habilitação", "Renovação", "Mudança de Categoria"],
-            "CLT": ["Todas", "Admissional", "Periódico", "Demissional", "Mudança de Função", "Retorno ao Trabalho"],
-            "CLT + CNH": ["Todas", "Admissional", "Periódico", "Demissional", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Mudança de Função", "Retorno ao Trabalho"],
-            "Todos": ["Todas", "Admissional", "Periódico", "Demissional", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Mudança de Função", "Retorno ao Trabalho"]
+            "CNH": ["Todas", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Contra Prova"],
+            "CLT": ["Todas", "Admissional", "Periódico", "Demissional", "Mudança de Função", "Retorno ao Trabalho", "Contra Prova"],
+            "CLT + CNH": ["Todas", "Admissional", "Periódico", "Demissional", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Mudança de Função", "Retorno ao Trabalho", "Contra Prova"],
+            "Todos": ["Todas", "Admissional", "Periódico", "Demissional", "Primeira Habilitação", "Renovação", "Mudança de Categoria", "Mudança de Função", "Retorno ao Trabalho", "Contra Prova"]
         }
 
         subfinalidades_disponiveis = subfinalidades_por_tipo.get(filtro_tipo_exame, subfinalidades_por_tipo["Todos"])
         filtro_subfinalidade = st.selectbox("Subfinalidade", subfinalidades_disponiveis, key="det_subfinalidade")
 
+    with col_tipo_subst:
+        # Tipo de Substância (Ilícito, Medicamento, Psicoativo legal)
+        tipos_substancia_opcoes = ["Todos", "Ilícito", "Medicamento"]
+        filtro_tipo_substancia = st.selectbox("Tipo de Substância", tipos_substancia_opcoes, key="det_tipo_substancia")
+
     st.markdown("---")
 
-    df = loading_single(get_substance_data, "Carregando tabela detalhada...")
+    # Preparar filtros para paginação server-side
+    filters = {
+        'tipo_exame': filtro_tipo_exame if filtro_tipo_exame != 'Todos' else None,
+        'subfinalidade': filtro_subfinalidade if filtro_subfinalidade != 'Todas' else None,
+        'resultado': filtro_positivas if filtro_positivas != 'Todos' else None
+    }
 
-    if df.empty:
+    # Resetar página se filtros mudaram
+    filter_key = f"{filtro_tipo_exame}_{filtro_subfinalidade}_{filtro_positivas}_{filtro_tipo_substancia}"
+    if 'last_filter_key' not in st.session_state or st.session_state.last_filter_key != filter_key:
+        st.session_state.tabela_page = 1
+        st.session_state.last_filter_key = filter_key
+
+    # Carregar dados com paginação
+    with st.spinner("Carregando dados..."):
+        df, total_count, total_pages = get_substance_data_paginated(
+            page=st.session_state.tabela_page,
+            page_size=st.session_state.tabela_page_size,
+            filters=filters
+        )
+
+    if df.empty and total_count == 0:
         st.warning("⚠️ Nenhum dado encontrado")
         return
 
     # Colunas de substâncias (excluindo colunas de metadados)
     substance_cols = [col for col in df.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']]
 
-    # Aplicar filtros
+    # Filtrar colunas de substâncias por tipo selecionado
+    if filtro_tipo_substancia != 'Todos':
+        # Obter nomes das substâncias do tipo selecionado
+        substancias_do_tipo = get_compound_names_by_type(filtro_tipo_substancia)
+        # Filtrar apenas as colunas que correspondem ao tipo
+        substance_cols = [col for col in substance_cols if col in substancias_do_tipo]
+
+    # Aplicar filtros locais (lote, amostra, substância específica)
     df_filtrado = df.copy()
 
     if filtro_lote:
         df_filtrado = df_filtrado[df_filtrado['Lote'].str.contains(filtro_lote, case=False, na=False)]
 
     if filtro_amostra:
-        df_filtrado = df_filtrado[df_filtrado['Amostra'].str.contains(filtro_amostra, case=False, na=False)]
+        df_filtrado = df_filtrado[df_filtrado['Amostra'].astype(str).str.contains(filtro_amostra, case=False, na=False)]
 
-    if filtro_positivas == 'Positivo':
-        df_filtrado = df_filtrado[df_filtrado[substance_cols].apply(lambda row: (row == 'Positivo').any(), axis=1)]
-    elif filtro_positivas == 'Negativo':
-        df_filtrado = df_filtrado[df_filtrado[substance_cols].apply(lambda row: (row == 'Negativo').all(), axis=1)]
-
-    if filtro_substancia != 'Todas':
+    if filtro_substancia != 'Todas' and filtro_substancia in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado[filtro_substancia] == 'Positivo']
-
-    # Aplicar filtros em cascata de finalidade
-    if filtro_tipo_exame != 'Todos':
-        df_filtrado = df_filtrado[df_filtrado['Tipo Exame'] == filtro_tipo_exame]
-
-    if filtro_subfinalidade != 'Todas':
-        df_filtrado = df_filtrado[df_filtrado['Subfinalidade'] == filtro_subfinalidade]
 
     # ============================================
     # COMPARATIVO DE CONCENTRAÇÃO (quando filtrar por amostra específica)
@@ -6154,11 +7147,12 @@ def render_tabela_detalhada():
         # Mostrar informação do laboratório
         if lab_info.get("lab_name"):
             lab_location = f"{lab_info.get('lab_city', '')}/{lab_info.get('lab_state', '')}" if lab_info.get('lab_city') else ""
-            st.info(f"🏢 **Laboratório:** {lab_info['lab_name']} {f'({lab_location})' if lab_location else ''}")
+            lab_has_avg = len(avg_data_lab) > 0
+            lab_avg_status = "✅ Média disponível" if lab_has_avg else "⚠️ Sem dados de média no período"
+            st.info(f"🏢 **Laboratório:** {lab_info['lab_name']} {f'({lab_location})' if lab_location else ''} | {lab_avg_status}")
 
         if concentration_data:
             # Filtrar apenas substâncias positivas na amostra
-            # O campo positive pode ser True (bool) ou valor truthy
             positive_compounds = {k: v for k, v in concentration_data.items() if v.get("positive") == True}
 
             if positive_compounds:
@@ -6284,23 +7278,51 @@ def render_tabela_detalhada():
         else:
             st.warning(f"Não foi possível encontrar dados de concentração para a amostra '{amostra_code}'. Verifique se o código está correto.")
 
-    # Estatísticas
-    col1, col2, col3, col4 = st.columns(4)
+    # Estatísticas (baseadas no total, não apenas na página atual)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.metric("Total de Registros", f"{len(df_filtrado):,}".replace(",", "."))
+        st.metric("Total de Amostras", f"{total_count:,}".replace(",", "."))
 
     with col2:
-        total_lotes = df_filtrado['Lote'].nunique()
-        st.metric("Lotes", f"{total_lotes:,}".replace(",", "."))
+        total_lotes = df_filtrado['Lote'].nunique() if not df_filtrado.empty else 0
+        st.metric("Lotes (página)", f"{total_lotes:,}".replace(",", "."))
 
     with col3:
-        amostras_positivas = df_filtrado[df_filtrado[substance_cols].apply(lambda row: (row == 'Positivo').any(), axis=1)].shape[0]
-        st.metric("Amostras Positivas", f"{amostras_positivas:,}".replace(",", "."))
+        if substance_cols and not df_filtrado.empty:
+            amostras_positivas = df_filtrado[df_filtrado[substance_cols].apply(lambda row: (row == 'Positivo').any(), axis=1)].shape[0]
+        else:
+            amostras_positivas = 0
+        st.metric("Positivas (página)", f"{amostras_positivas:,}".replace(",", "."))
 
-    with col4:
-        taxa = (amostras_positivas / len(df_filtrado) * 100) if len(df_filtrado) > 0 else 0
-        st.metric("Taxa de Positividade", f"{taxa:.2f}%")
+    # Resumo de substâncias positivas na página
+    if substance_cols and not df_filtrado.empty:
+        substancias_positivas = {}
+        for col in substance_cols:
+            count = (df_filtrado[col] == 'Positivo').sum()
+            if count > 0:
+                substancias_positivas[col] = count
+
+        if substancias_positivas:
+            # Ordenar por quantidade (maior para menor)
+            sorted_subs = sorted(substancias_positivas.items(), key=lambda x: x[1], reverse=True)
+            # Criar badges para cada substância
+            badges_html = " ".join([
+                f'<span style="display: inline-block; margin: 2px 4px; padding: 4px 10px; background: #dc3545; color: white; border-radius: 12px; font-size: 0.85rem; font-weight: 500;">{sub}: {count}</span>'
+                for sub, count in sorted_subs
+            ])
+            st.markdown(f"""
+            <div style="margin-top: 10px;">
+                <span style="color: #FAFAFA; font-size: 0.9rem; margin-right: 8px;">🔴 Substâncias positivas na página:</span>
+                {badges_html}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style="margin-top: 10px;">
+                <span style="color: #28a745; font-size: 0.9rem;">✅ Nenhuma substância positiva nesta página</span>
+            </div>
+            """, unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -6311,67 +7333,189 @@ def render_tabela_detalhada():
         - Linhas com pelo menos uma substância positiva: fundo vermelho, texto preto
         - Células de substâncias positivas: texto branco, negrito
         """
-        # Colunas de substâncias
         sub_cols = [col for col in df.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']]
-
-        # Criar DataFrame de estilos
         styles = pd.DataFrame('', index=df.index, columns=df.columns)
 
         for idx in df.index:
             row = df.loc[idx]
-            # Verificar se a linha tem alguma substância positiva
             has_positive = any(row[col] == 'Positivo' for col in sub_cols if col in row.index)
 
             if has_positive:
-                # Aplicar fundo vermelho claro em toda a linha
                 for col in df.columns:
                     styles.loc[idx, col] = 'background-color: #ffcccc; color: black;'
-
-                # Aplicar estilo especial nas células de substâncias positivas
                 for col in sub_cols:
                     if col in row.index and row[col] == 'Positivo':
                         styles.loc[idx, col] = 'background-color: #dc3545; color: white; font-weight: bold;'
 
         return styles
 
+    # Filtrar colunas do dataframe para exibição quando filtro de tipo de substância estiver ativo
+    if filtro_tipo_substancia != 'Todos':
+        # Definir colunas de metadados que sempre aparecem
+        meta_cols = ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']
+        # Filtrar para mostrar apenas as colunas de metadados + substâncias do tipo selecionado
+        cols_to_show = [col for col in df_filtrado.columns if col in meta_cols or col in substance_cols]
+        df_exibicao = df_filtrado[cols_to_show]
+    else:
+        df_exibicao = df_filtrado
+
     # Tabela com estilo
-    if not df_filtrado.empty:
-        styled_df = df_filtrado.style.apply(lambda _: style_table(df_filtrado), axis=None)
+    if not df_exibicao.empty:
+        styled_df = df_exibicao.style.apply(lambda _: style_table(df_exibicao), axis=None)
         st.dataframe(styled_df, use_container_width=True, hide_index=True, height=500)
     else:
-        st.dataframe(df_filtrado, use_container_width=True, hide_index=True, height=500)
+        st.dataframe(df_exibicao, use_container_width=True, hide_index=True, height=500)
+
+    # Controles de paginação (abaixo da tabela)
+    st.markdown("---")
+    col_pag1, col_pag2, col_pag3, col_pag4, col_pag5 = st.columns([1, 1, 2, 1, 1])
+
+    with col_pag1:
+        if st.button("⏮️ Primeira", disabled=st.session_state.tabela_page <= 1, use_container_width=True):
+            st.session_state.tabela_page = 1
+            st.rerun()
+
+    with col_pag2:
+        if st.button("◀️ Anterior", disabled=st.session_state.tabela_page <= 1, use_container_width=True):
+            st.session_state.tabela_page -= 1
+            st.rerun()
+
+    with col_pag3:
+        st.markdown(f"""
+        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 5px;">
+            <span style="color: #FAFAFA;">Página <strong>{st.session_state.tabela_page}</strong> de <strong>{total_pages}</strong></span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_pag4:
+        if st.button("Próxima ▶️", disabled=st.session_state.tabela_page >= total_pages, use_container_width=True):
+            st.session_state.tabela_page += 1
+            st.rerun()
+
+    with col_pag5:
+        if st.button("Última ⏭️", disabled=st.session_state.tabela_page >= total_pages, use_container_width=True):
+            st.session_state.tabela_page = total_pages
+            st.rerun()
+
+    # Seletor de itens por página
+    col_size, col_goto = st.columns([1, 1])
+    with col_size:
+        new_page_size = st.selectbox(
+            "Itens por página",
+            [50, 100, 200, 500],
+            index=[50, 100, 200, 500].index(st.session_state.tabela_page_size),
+            key="page_size_select"
+        )
+        if new_page_size != st.session_state.tabela_page_size:
+            st.session_state.tabela_page_size = new_page_size
+            st.session_state.tabela_page = 1
+            st.rerun()
+
+    with col_goto:
+        goto_page = st.number_input(
+            "Ir para página",
+            min_value=1,
+            max_value=max(1, total_pages),
+            value=st.session_state.tabela_page,
+            key="goto_page_input"
+        )
+        if goto_page != st.session_state.tabela_page:
+            st.session_state.tabela_page = goto_page
+            st.rerun()
+
+    st.markdown("---")
 
     # Exportação
     st.markdown("### ⬇️ Exportar Dados")
 
-    col_exp1, col_exp2 = st.columns(2)
+    col_exp1, col_exp2, col_exp3 = st.columns(3)
 
     with col_exp1:
-        csv = df_filtrado.to_csv(index=False, encoding='utf-8-sig')
+        # Excel da página atual
+        output_pagina = io.BytesIO()
+        with pd.ExcelWriter(output_pagina, engine='openpyxl') as writer:
+            df_exibicao.to_excel(writer, index=False, sheet_name='Amostras')
+        excel_pagina = output_pagina.getvalue()
+
         st.download_button(
-            "📄 Download CSV",
-            csv,
-            "amostras_detalhadas.csv",
-            "text/csv",
-            use_container_width=True
+            "📄 Excel (página atual)",
+            excel_pagina,
+            "amostras_pagina_atual.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Exporta apenas os registros exibidos na página atual"
         )
 
     with col_exp2:
-        # Excel
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_filtrado.to_excel(writer, index=False, sheet_name='Amostras')
-        excel_data = output.getvalue()
+        # Botão para exportar todos os dados com filtros aplicados
+        if st.button("📊 Excel (filtros aplicados)", use_container_width=True, help="Exporta todos os resultados do período com os filtros atuais"):
+            with st.spinner("Carregando todos os dados com filtros aplicados..."):
+                df_completo = get_substance_data()
+                if not df_completo.empty:
+                    # Aplicar mesmos filtros
+                    if filtro_tipo_exame != 'Todos':
+                        df_completo = df_completo[df_completo['Tipo Exame'] == filtro_tipo_exame]
+                    if filtro_subfinalidade != 'Todas':
+                        df_completo = df_completo[df_completo['Subfinalidade'] == filtro_subfinalidade]
+                    if filtro_positivas == 'Positivo':
+                        sub_cols_exp = [col for col in df_completo.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']]
+                        df_completo = df_completo[df_completo[sub_cols_exp].apply(lambda row: (row == 'Positivo').any(), axis=1)]
+                    elif filtro_positivas == 'Negativo':
+                        sub_cols_exp = [col for col in df_completo.columns if col not in ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']]
+                        df_completo = df_completo[df_completo[sub_cols_exp].apply(lambda row: (row == 'Negativo').all(), axis=1)]
 
-        st.download_button(
-            "📊 Download Excel",
-            excel_data,
-            "amostras_detalhadas.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+                    # Aplicar filtro de tipo de substância nas colunas
+                    if filtro_tipo_substancia != 'Todos':
+                        meta_cols_exp = ['Data', 'Lote', 'Tipo de Lote', 'Tipo Exame', 'Subfinalidade', 'Amostra']
+                        substancias_filtradas = get_compound_names_by_type(filtro_tipo_substancia)
+                        cols_exp = [col for col in df_completo.columns if col in meta_cols_exp or col in substancias_filtradas]
+                        df_completo = df_completo[cols_exp]
 
-    st.caption(f"Total: {len(df_filtrado):,} registros".replace(",", "."))
+                    # Gerar Excel
+                    output_filtrado = io.BytesIO()
+                    with pd.ExcelWriter(output_filtrado, engine='openpyxl') as writer:
+                        df_completo.to_excel(writer, index=False, sheet_name='Amostras')
+                    excel_filtrado = output_filtrado.getvalue()
+
+                    st.download_button(
+                        "⬇️ Baixar Excel (filtros aplicados)",
+                        excel_filtrado,
+                        "amostras_filtradas.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_filtrado"
+                    )
+                    st.success(f"Pronto! {len(df_completo):,} registros disponíveis para download.".replace(",", "."))
+                else:
+                    st.warning("Nenhum dado para exportar.")
+
+    with col_exp3:
+        # Botão para exportar todos os dados de 2026 em diante
+        if st.button("📥 Excel (2026)", use_container_width=True, help="Exporta todos os registros a partir de 01/01/2026"):
+            with st.spinner("Carregando todos os dados de 2026 em diante..."):
+                # Buscar dados desde 01/01/2026
+                data_inicio_2026 = datetime(2026, 1, 1, 0, 0, 0)
+                data_fim = datetime.now().replace(hour=23, minute=59, second=59)
+
+                df_2026 = get_substance_data_full(data_inicio_2026, data_fim)
+                if not df_2026.empty:
+                    # Gerar Excel
+                    output_2026 = io.BytesIO()
+                    with pd.ExcelWriter(output_2026, engine='openpyxl') as writer:
+                        df_2026.to_excel(writer, index=False, sheet_name='Amostras_2026')
+                    excel_2026 = output_2026.getvalue()
+
+                    st.download_button(
+                        "⬇️ Baixar Excel (2026+)",
+                        excel_2026,
+                        "amostras_2026_em_diante.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_2026"
+                    )
+                    st.success(f"Pronto! {len(df_2026):,} registros disponíveis para download.".replace(",", "."))
+                else:
+                    st.warning("Nenhum dado encontrado para 2026 em diante.")
+
+    st.caption(f"Exibindo {len(df_exibicao):,} de {total_count:,} registros".replace(",", "."))
 
 
 def render_auditoria():
