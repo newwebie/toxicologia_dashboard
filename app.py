@@ -1315,7 +1315,6 @@ def main():
     paginas_render = {
         "🏠 Visão Geral": ("Visão Geral", render_visao_geral),
         "👤 Perfil Demográfico": ("Perfil Demográfico", render_perfil_demografico),
-        "🧪 Substâncias": ("Substâncias", render_substancias),
         "🗺️ Mapa Geográfico": ("Mapa Geográfico", render_mapa),
         "📈 Análise Temporal": ("Análise Temporal", render_temporal),
         "📋 Tabela Detalhada": ("Tabela Detalhada", render_tabela_detalhada),
@@ -2104,14 +2103,14 @@ def get_average_concentrations() -> dict:
 def get_sample_laboratory(sample_code: str) -> dict:
     """
     Busca o laboratório vinculado a uma amostra.
-    Caminho: sample -> lot -> chainOfCustody -> gathering -> laboratory
+    Caminho: sample_code -> chainofcustodies (sample.code) -> gatherings (_chainOfCustody) -> laboratory
     Retorna dict com lab_id, lab_name, lab_city, lab_state
     """
     try:
         client = get_mongo_client()
         db = client["ctox"]
 
-        # O _sample pode ser string ou número
+        # O sample.code pode ser string ou número
         sample_code_clean = str(sample_code).strip()
         sample_match_values = [sample_code_clean]
         try:
@@ -2119,35 +2118,21 @@ def get_sample_laboratory(sample_code: str) -> dict:
         except:
             pass
 
-        # 1. Buscar o resultado que contém essa amostra para pegar o _lot
-        results_collection = db["results"]
-        result = results_collection.find_one(
-            {"samples._sample": {"$in": sample_match_values}},
-            {"_lot": 1}
+        # 1. Buscar o chainOfCustody pelo sample.code
+        chains_collection = db["chainofcustodies"]
+        chain = chains_collection.find_one(
+            {"sample.code": {"$in": sample_match_values}},
+            {"_id": 1}
         )
 
-        if not result:
+        if not chain:
             return {}
 
-        lot_code = result.get("_lot")
-        if not lot_code:
-            return {}
-
-        # 2. Buscar o lote para pegar o _chainOfCustody
-        lots_collection = db["lots"]
-        lot = lots_collection.find_one(
-            {"code": lot_code},
-            {"_chainOfCustody": 1}
-        )
-
-        if not lot:
-            return {}
-
-        chain_id = lot.get("_chainOfCustody")
+        chain_id = chain.get("_id")
         if not chain_id:
             return {}
 
-        # 3. Buscar o gathering para pegar o _laboratory
+        # 2. Buscar o gathering para pegar o _laboratory
         gatherings_collection = db["gatherings"]
         gathering = gatherings_collection.find_one(
             {"_chainOfCustody": chain_id},
@@ -2161,7 +2146,7 @@ def get_sample_laboratory(sample_code: str) -> dict:
         if not lab_id:
             return {}
 
-        # 4. Buscar informações do laboratório
+        # 3. Buscar informações do laboratório
         labs_map = get_laboratories_map()
         lab_id_str = str(lab_id)
 
@@ -2206,6 +2191,7 @@ def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
         results_collection = db["results"]
         lots_collection = db["lots"]
         gatherings_collection = db["gatherings"]
+        chains_collection = db["chainofcustodies"]
 
         # Converter laboratory_id para ObjectId
         try:
@@ -2213,17 +2199,23 @@ def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
         except Exception:
             return {}
 
-        # 1. Buscar gatherings do laboratório para pegar os chainOfCustody
+        # 1. Buscar gatherings do laboratório para pegar os chainOfCustody IDs
         lab_gatherings = list(gatherings_collection.find(
-            {"_laboratory": lab_oid},
+            {
+                "_laboratory": lab_oid,
+                "createdAt": {"$gte": start_date, "$lte": end_date}
+            },
             {"_chainOfCustody": 1}
         ))
         chain_ids = [g.get("_chainOfCustody") for g in lab_gatherings if g.get("_chainOfCustody")]
 
         if not chain_ids:
-            # Tentar buscar também por string do laboratory_id (alguns documentos podem ter string)
+            # Tentar buscar também por string do laboratory_id
             lab_gatherings = list(gatherings_collection.find(
-                {"_laboratory": laboratory_id},
+                {
+                    "_laboratory": laboratory_id,
+                    "createdAt": {"$gte": start_date, "$lte": end_date}
+                },
                 {"_chainOfCustody": 1}
             ))
             chain_ids = [g.get("_chainOfCustody") for g in lab_gatherings if g.get("_chainOfCustody")]
@@ -2231,11 +2223,35 @@ def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
         if not chain_ids:
             return {}
 
-        # 2. Buscar lotes do período que pertencem a essas chains
+        # 2. Buscar os sample codes das chains do laboratório
+        chains = list(chains_collection.find(
+            {"_id": {"$in": chain_ids}},
+            {"sample.code": 1}
+        ))
+
+        # Criar lista de sample_codes com ambos os tipos (string e int) para match correto
+        sample_codes = []
+        for c in chains:
+            code = c.get("sample", {}).get("code")
+            if code is not None:
+                sample_codes.append(code)
+                # Adicionar também a versão string/int para garantir o match
+                if isinstance(code, int):
+                    sample_codes.append(str(code))
+                elif isinstance(code, str):
+                    try:
+                        sample_codes.append(int(code))
+                    except:
+                        pass
+
+        if not sample_codes:
+            return {}
+
+        # 3. Buscar lotes do período que contêm essas chains
         lots_period = list(lots_collection.find(
             {
                 "createdAt": {"$gte": start_date, "$lte": end_date},
-                "_chainOfCustody": {"$in": chain_ids}
+                "_samples": {"$in": chain_ids}
             },
             {"code": 1}
         ))
@@ -2244,10 +2260,11 @@ def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
         if not lot_codes:
             return {}
 
-        # 3. Pipeline para calcular média de concentração por substância (apenas positivos)
+        # 4. Pipeline para calcular média de concentração por substância (apenas positivos do lab)
         pipeline = [
             {"$match": {"_lot": {"$in": lot_codes}}},
             {"$unwind": "$samples"},
+            {"$match": {"samples._sample": {"$in": sample_codes}}},  # Filtrar apenas amostras do lab
             {"$unwind": "$samples._compound"},
             {"$match": {"samples._compound.positive": True}},
             {
@@ -2369,6 +2386,89 @@ def get_confirmatorio_thc_data(laboratory_id: str = None, month: int = None, pur
     Busca dados de Confirmatório THC (confirmatoryTHC) - USA DADOS PRÉ-CARREGADOS.
     """
     return count_results_by_type("confirmatoryTHC", laboratory_id, month, purpose_type)
+
+
+def get_positivity_by_laboratory(start_date: datetime = None, end_date: datetime = None) -> dict:
+    """
+    Retorna dados agregados de positividade por laboratório.
+    Usado pela página de Auditoria para detectar anomalias.
+
+    Retorna: dict {lab_id: {"total": int, "positivos": int, "taxa": float}}
+
+    Taxa = positivas confirmatório / total triagem * 100
+    """
+    cache_key = f"positivity_by_lab_{start_date}_{end_date}"
+    cached = get_cached_data("positivity_by_lab", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        if start_date is None or end_date is None:
+            start_date, end_date = get_selected_period()
+
+        # Obter mapeamentos
+        gatherings_data = get_all_gatherings(start_date, end_date)
+        chain_to_lab = gatherings_data.get("chain_to_lab", {})
+        chain_to_code = get_chain_to_sample_map(start_date, end_date)
+
+        # Mapear sample_code para lab_id
+        sample_to_lab = {}
+        for chain_id, lab_id in chain_to_lab.items():
+            sample_code = chain_to_code.get(chain_id)
+            if sample_code:
+                sample_to_lab[sample_code] = lab_id
+
+        # Obter lotes e resultados
+        lots_dict = get_all_lots(start_date, end_date)
+        results_dict = get_all_results(start_date, end_date)
+
+        # Dicionário para agregar por laboratório
+        lab_data = {}
+
+        # Contar triagem (screening) por laboratório
+        for lot_code, lot_data in lots_dict.items():
+            if lot_data.get("analysisType") != "screening":
+                continue
+
+            lot_samples = lot_data.get("_samples", set())
+            lot_results = results_dict.get(lot_code, [])
+
+            for sample in lot_results:
+                sample_code = sample.get("_sample")
+                lab_id = sample_to_lab.get(sample_code)
+
+                if lab_id:
+                    if lab_id not in lab_data:
+                        lab_data[lab_id] = {"total": 0, "positivos": 0}
+                    lab_data[lab_id]["total"] += 1
+
+        # Contar positivos do confirmatório por laboratório
+        for lot_code, lot_data in lots_dict.items():
+            if lot_data.get("analysisType") != "confirmatory":
+                continue
+
+            lot_results = results_dict.get(lot_code, [])
+
+            for sample in lot_results:
+                sample_code = sample.get("_sample")
+                lab_id = sample_to_lab.get(sample_code)
+
+                if lab_id and sample.get("positive", False):
+                    if lab_id not in lab_data:
+                        lab_data[lab_id] = {"total": 0, "positivos": 0}
+                    lab_data[lab_id]["positivos"] += 1
+
+        # Calcular taxa para cada laboratório
+        for lab_id, data in lab_data.items():
+            total = data["total"]
+            positivos = data["positivos"]
+            data["taxa"] = (positivos / total * 100) if total > 0 else 0
+
+        set_cached_data("positivity_by_lab", cache_key, lab_data)
+        return lab_data
+
+    except Exception as e:
+        return {}
 
 
 def get_total_samples(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> int:
@@ -4765,782 +4865,6 @@ def get_positivity_by_renach(
         return {}
 
 
-def render_taxa_positividade():
-
-    st.title("📊 Taxa de Positividade")
-
-    # Filtros na página
-    st.markdown("### 🔍 Filtros")
-
-    # Primeira linha de filtros: CNPJ Laboratório (multiselect) e Período
-    col_f1, col_f2 = st.columns([2, 1])
-
-    with col_f1:
-        # Buscar laboratórios por CNPJ
-        labs_by_cnpj = get_laboratories_by_cnpj()
-        cnpj_options = sorted(labs_by_cnpj.keys())
-
-        selected_cnpjs = st.multiselect(
-            "CNPJ Laboratório (seleção múltipla)",
-            options=cnpj_options,
-            default=[],
-            key="taxa_labs_multi",
-            placeholder="Selecione um ou mais CNPJs..."
-        )
-
-        # Obter IDs e informações dos laboratórios selecionados
-        lab_ids_filter = []
-        selected_labs_info = []
-        for cnpj in selected_cnpjs:
-            lab_info = labs_by_cnpj.get(cnpj, {})
-            if lab_info.get("id"):
-                lab_ids_filter.append(lab_info["id"])
-                selected_labs_info.append(lab_info)
-
-        lab_ids_filter = lab_ids_filter if lab_ids_filter else None
-
-    with col_f2:
-        # Mostrar período selecionado (vem do filtro global na sidebar)
-        periodo_inicio, periodo_fim = get_selected_period()
-        st.markdown("**Período (filtro global)**")
-        st.info(f"📅 {periodo_inicio.strftime('%d/%m/%Y')} a {periodo_fim.strftime('%d/%m/%Y')}")
-
-    # Segunda linha de filtros
-    col_f3, col_f4, col_f5, col_f6 = st.columns(4)
-
-    with col_f3:
-        finalidades = {
-            "Todos": None,
-            "Periódico": "periodic",
-            "Mudança de Categoria": "categoryChange",
-            "Admissão": "hiring",
-            "Renovação": "renovation",
-            "Demissão": "resignation"
-        }
-        selected_finalidade = st.selectbox(
-            "Finalidade da Amostra",
-            options=list(finalidades.keys()),
-            index=0,
-            key="taxa_finalidade"
-        )
-        purpose_filter = finalidades[selected_finalidade]
-
-    with col_f4:
-        renach_options = {
-            "Todos": None,
-            "Sim": "sim",
-            "Não": "nao"
-        }
-        selected_renach = st.selectbox(
-            "Status Renach",
-            options=list(renach_options.keys()),
-            index=0,
-            key="taxa_renach"
-        )
-        renach_filter = renach_options[selected_renach]
-
-    with col_f5:
-        tipo_lote_options = {
-            "Todos": "all",
-            "Triagem": "screening",
-            "Confirmatório": "confirmatory",
-            "Confirmatório THC": "confirmatoryTHC"
-        }
-        selected_tipo_lote = st.selectbox(
-            "Tipo de Lote",
-            options=list(tipo_lote_options.keys()),
-            index=0,
-            key="taxa_tipo_lote"
-        )
-        analysis_type_filter = tipo_lote_options[selected_tipo_lote]
-
-    with col_f6:
-        # Estado do laboratório
-        states = get_unique_states()
-        state_options = ["Todos"] + states
-        selected_state = st.selectbox(
-            "Estado (UF)",
-            options=state_options,
-            index=0,
-            key="taxa_estado"
-        )
-        state_filter = selected_state if selected_state != "Todos" else None
-
-    # Terceira linha: Cidade (dependente do estado)
-    col_f7, col_f8, col_f9 = st.columns([1, 1, 2])
-
-    with col_f7:
-        cities = get_cities_by_state(state_filter)
-        city_options = ["Todas"] + cities
-        selected_city = st.selectbox(
-            "Cidade",
-            options=city_options,
-            index=0,
-            key="taxa_cidade"
-        )
-        city_filter = selected_city if selected_city != "Todas" else None
-
-    # Exibir informações dos laboratórios selecionados
-    if selected_labs_info:
-        labs_display = []
-        for lab in selected_labs_info:
-            name = lab.get("name", "")
-            city = lab.get("city", "")
-            state = lab.get("state", "")
-            location = f"{city}/{state}" if city and state else ""
-            labs_display.append(f"**{name}** {f'({location})' if location else ''}")
-        st.success(f"🏢 Laboratórios selecionados: {', '.join(labs_display)}")
-
-    # Usar período do filtro global
-    start_date_filter, end_date_filter = get_selected_period()
-
-    # Parâmetros comuns para as funções
-    common_params = {
-        "laboratory_ids": lab_ids_filter,
-        "purpose_type": purpose_filter,
-        "renach_status": renach_filter,
-        "analysis_type": analysis_type_filter,
-        "state": state_filter,
-        "city": city_filter,
-        "start_date_filter": start_date_filter,
-        "end_date_filter": end_date_filter
-    }
-
-    # Carregar dados com progress bar
-    tasks_list = [
-        ("Dados mensais", get_monthly_positivity_data, (), common_params),
-        ("Métricas", get_metrics_data, (), common_params),
-    ]
-
-    # Se houver laboratórios selecionados, adicionar tarefa de dados por lab
-    if lab_ids_filter and len(lab_ids_filter) > 0:
-        tasks_list.append(("Dados por laboratório", get_monthly_data_by_lab, (), common_params))
-
-    results = loading_with_progress(tasks_list, "Carregando taxa de positividade...")
-
-    monthly_data = results.get("Dados mensais", {})
-    metrics = results.get("Métricas", {
-        "negativas_triagem": 0, "positivas_triagem": 0,
-        "negativas_confirmatorio": 0, "positivas_confirmatorio": 0,
-        "total_amostras": 0, "taxa_geral": 0.0
-    })
-    data_by_lab = results.get("Dados por laboratório", {})
-
-    # Buscar taxa média nacional para comparação
-    taxa_nacional = get_national_average_rate(start_date_filter, end_date_filter)
-
-    # Função para formatar números com ponto como separador de milhares
-    def format_number(n: int) -> str:
-        return f"{n:,}".replace(",", ".")
-
-    # Calcular diferença em relação à média nacional
-    taxa_lab = metrics.get("taxa_geral", 0.0)
-    diferenca_nacional = taxa_lab - taxa_nacional if taxa_nacional > 0 else 0.0
-    diferenca_texto = f"+{diferenca_nacional:.2f}%" if diferenca_nacional >= 0 else f"{diferenca_nacional:.2f}%"
-    diferenca_cor = "#FF6B6B" if diferenca_nacional > 0 else "#4CAF50"  # Vermelho se acima, verde se abaixo
-
-    # Cards - Primeira linha (principais)
-    st.markdown("### Resumo para o(s) CNPJ(s) selecionado(s)")
-
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-
-    with col_m1:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #1A1A2E 0%, #16213E 100%); padding: 15px; border-radius: 8px; text-align: center;">
-                <h2 style="color: #FFD700; margin: 0; font-size: 2rem;">{taxa_lab:.2f}%</h2>
-                <p style="color: #E8E8E8; margin: 8px 0 0 0; font-size: 0.8rem;">Taxa Geral de Positividade</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with col_m2:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #1A1A2E 0%, #16213E 100%); padding: 15px; border-radius: 8px; text-align: center;">
-                <h2 style="color: #00CED1; margin: 0; font-size: 2rem;">{format_number(metrics.get('total_amostras', 0))}</h2>
-                <p style="color: #E8E8E8; margin: 8px 0 0 0; font-size: 0.8rem;">Total de Amostras</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with col_m3:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #1A1A2E 0%, #16213E 100%); padding: 15px; border-radius: 8px; text-align: center;">
-                <h2 style="color: #00CED1; margin: 0; font-size: 2rem;">{taxa_nacional:.2f}%</h2>
-                <p style="color: #E8E8E8; margin: 8px 0 0 0; font-size: 0.8rem;">Taxa Média Nacional</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with col_m4:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #1A1A2E 0%, #16213E 100%); padding: 15px; border-radius: 8px; text-align: center;">
-                <h2 style="color: {diferenca_cor}; margin: 0; font-size: 2rem;">{diferenca_texto}</h2>
-                <p style="color: #E8E8E8; margin: 8px 0 0 0; font-size: 0.8rem;">Diferença vs Nacional</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Cards - Segunda linha (detalhamento triagem e confirmatório)
-    col_t1, col_t2, col_c1, col_c2 = st.columns(4)
-
-    with col_t1:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #0D4F4F 0%, #1A3A3A 100%); padding: 12px; border-radius: 8px; text-align: center;">
-                <h3 style="color: #4CAF50; margin: 0; font-size: 1.5rem;">{format_number(metrics.get('negativas_triagem', 0))}</h3>
-                <p style="color: #E8E8E8; margin: 5px 0 0 0; font-size: 0.75rem;">Negativas (Triagem)</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with col_t2:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #4F0D0D 0%, #3A1A1A 100%); padding: 12px; border-radius: 8px; text-align: center;">
-                <h3 style="color: #FF6B6B; margin: 0; font-size: 1.5rem;">{format_number(metrics.get('positivas_triagem', 0))}</h3>
-                <p style="color: #E8E8E8; margin: 5px 0 0 0; font-size: 0.75rem;">Positivas (Triagem)</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with col_c1:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #0D4F4F 0%, #1A3A3A 100%); padding: 12px; border-radius: 8px; text-align: center;">
-                <h3 style="color: #4CAF50; margin: 0; font-size: 1.5rem;">{format_number(metrics.get('negativas_confirmatorio', 0))}</h3>
-                <p style="color: #E8E8E8; margin: 5px 0 0 0; font-size: 0.75rem;">Negativas (Confirmatório)</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with col_c2:
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #4F0D0D 0%, #3A1A1A 100%); padding: 12px; border-radius: 8px; text-align: center;">
-                <h3 style="color: #FF6B6B; margin: 0; font-size: 1.5rem;">{format_number(metrics.get('positivas_confirmatorio', 0))}</h3>
-                <p style="color: #E8E8E8; margin: 5px 0 0 0; font-size: 0.75rem;">Positivas (Confirmatório)</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Se há laboratórios selecionados, mostrar gráfico de linhas por laboratório
-    if data_by_lab and len(data_by_lab) > 0:
-        st.subheader("Taxa de Positividade por Laboratório")
-
-        # Preparar dados para gráfico de linhas
-        meses_nomes = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
-                       "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
-
-        chart_data = []
-        for lab_data in data_by_lab.values():
-            lab_name = lab_data["lab_name"]
-            monthly = lab_data["monthly_data"]
-            for mes in meses_nomes:
-                if mes in monthly:
-                    chart_data.append({
-                        "Mês": mes,
-                        "Taxa": monthly[mes]["taxa"],
-                        "Laboratório": lab_name
-                    })
-
-        if chart_data:
-            df_lines = pd.DataFrame(chart_data)
-
-            # Ordenar meses corretamente
-            df_lines["Mês"] = pd.Categorical(df_lines["Mês"], categories=meses_nomes, ordered=True)
-            df_lines = df_lines.sort_values("Mês")
-
-            fig_lines = px.line(
-                df_lines,
-                x="Mês",
-                y="Taxa",
-                color="Laboratório",
-                markers=True,
-                title="Comparativo de Taxa de Positividade por Laboratório"
-            )
-
-            fig_lines.update_layout(
-                xaxis_title="",
-                yaxis_title="Taxa (%)",
-                yaxis_ticksuffix="%",
-                height=500,
-                margin=dict(t=50, b=50, l=50, r=50),
-                xaxis_tickangle=-45,
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=-0.3,
-                    xanchor="center",
-                    x=0.5
-                )
-            )
-
-            st.plotly_chart(fig_lines, use_container_width=True, key="chart_taxa_labs_linhas")
-
-        # Tabela com totais por laboratório
-        st.subheader("Métricas por Laboratório")
-
-        table_data = []
-        for lab_data in data_by_lab.values():
-            lab_metrics = lab_data["metrics"]
-
-            # Total de amostras = triagem
-            total_amostras = lab_metrics.get("total_amostras", 0)
-            # Positivas = confirmatório
-            positivas_conf = lab_metrics.get("positivas_confirmatorio", 0)
-            # Taxa = positivas confirmatórias / total amostras triagem
-            taxa_media = (positivas_conf / total_amostras * 100) if total_amostras > 0 else 0
-
-            table_data.append({
-                "Laboratório": lab_data["lab_name"],
-                "Neg. Triagem": format_number(lab_metrics["negativas_triagem"]),
-                "Neg. Confirmatório": format_number(lab_metrics["negativas_confirmatorio"]),
-                "Pos. Confirmatório": format_number(lab_metrics["positivas_confirmatorio"]),
-                "Total Amostras": format_number(total_amostras),
-                "Taxa Média (%)": f"{taxa_media:.2f}%"
-            })
-
-        if table_data:
-            df_table = pd.DataFrame(table_data)
-            st.dataframe(df_table, use_container_width=True, hide_index=True)
-
-    # Gráfico de barras (total ou quando nenhum lab selecionado)
-    if monthly_data:
-        if not data_by_lab:
-            st.subheader("Total de Amostras por Mês")
-
-        meses = list(monthly_data.keys())
-        totais = [monthly_data[m]["positivo"] + monthly_data[m]["negativo"] for m in meses]
-        taxas = [monthly_data[m]["taxa"] for m in meses]
-
-        df_chart = pd.DataFrame({
-            "Mês": meses,
-            "Total": totais,
-            "Taxa": taxas
-        })
-
-        # Texto mostrando total e taxa
-        df_chart["Texto"] = df_chart.apply(
-            lambda row: f"{row['Total']:,} ({row['Taxa']:.1f}%)".replace(",", "."), axis=1
-        )
-
-        title = "Total de Amostras por Mês" if data_by_lab else "Total de Amostras por Mês"
-
-        fig = px.bar(
-            df_chart,
-            x="Mês",
-            y="Total",
-            title=title,
-            text="Texto",
-            color="Taxa",
-            color_continuous_scale=['#00CED1', '#1A1A2E']
-        )
-
-        fig.update_traces(
-            textposition='outside',
-            textfont_size=10
-        )
-
-        fig.update_layout(
-            xaxis_title="",
-            yaxis_title="Total de Amostras",
-            height=500,
-            margin=dict(t=50, b=50, l=50, r=50),
-            xaxis_tickangle=-45,
-            showlegend=False,
-            coloraxis_showscale=False
-        )
-
-        st.plotly_chart(fig, use_container_width=True, key="chart_taxa_mensal")
-    else:
-        st.warning("Nenhum dado encontrado")
-
-    st.markdown("---")
-
-    # ============================================
-    # SEÇÃO DE ANÁLISES DETALHADAS
-    # ============================================
-    st.subheader("Análises Detalhadas")
-
-    # Buscar dados para os gráficos analíticos com progress bar
-    detailed_tasks = [
-        ("Substâncias", get_positivity_by_substance, (lab_ids_filter, start_date_filter, end_date_filter)),
-        ("Estados", get_positivity_by_state, (lab_ids_filter, start_date_filter, end_date_filter)),
-        ("Finalidades", get_positivity_by_purpose, (lab_ids_filter, start_date_filter, end_date_filter)),
-        ("Tipos de lote", get_positivity_by_lot_type, (lab_ids_filter, start_date_filter, end_date_filter)),
-        ("RENACH", get_positivity_by_renach, (lab_ids_filter, start_date_filter, end_date_filter)),
-    ]
-
-    detailed_results = loading_with_progress(detailed_tasks, "Carregando análises detalhadas...")
-
-    substance_data = detailed_results.get("Substâncias", {})
-    state_data = detailed_results.get("Estados", {})
-    purpose_data = detailed_results.get("Finalidades", {})
-    lot_type_data = detailed_results.get("Tipos de lote", {})
-    renach_status_data = detailed_results.get("RENACH", {})
-
-    # Primeira linha: Substâncias - gráfico de barras horizontal
-    st.markdown("#### Positividade por Substância")
-    if substance_data:
-        # Filtrar apenas substâncias com positivos
-        positive_substances = {k: v for k, v in substance_data.items() if v["positivo"] > 0}
-
-        if positive_substances:
-            df_substance = pd.DataFrame([
-                {
-                    "Substância": k,
-                    "Positivos": v["positivo"],
-                    "Total": v["total"],
-                    "Taxa (%)": v["percentual"]
-                }
-                for k, v in positive_substances.items()
-            ])
-            df_substance = df_substance.sort_values("Positivos", ascending=True)
-
-            # Calcular percentual de cada substância no total de positivos
-            total_positivos = df_substance["Positivos"].sum()
-            df_substance["% do Total"] = (df_substance["Positivos"] / total_positivos * 100).round(2)
-
-            col_graf_sub, col_tab_sub = st.columns([2, 1])
-
-            with col_graf_sub:
-                # Gráfico de barras horizontal - quantidade de positivos por substância
-                fig_bar_sub = px.bar(
-                    df_substance,
-                    x='Positivos',
-                    y='Substância',
-                    orientation='h',
-                    title='Quantidade de Amostras Positivas por Substância',
-                    text=df_substance['Positivos'].apply(lambda x: f"{x:,}".replace(",", ".")),
-                    color='Positivos',
-                    color_continuous_scale=['#00CED1', '#1A1A2E']
-                )
-                fig_bar_sub.update_traces(textposition='outside', textfont_size=10)
-                fig_bar_sub.update_layout(
-                    height=max(400, len(df_substance) * 25),
-                    xaxis_title="Quantidade de Positivos",
-                    yaxis_title="",
-                    showlegend=False,
-                    coloraxis_showscale=False,
-                    margin=dict(l=10, r=10, t=40, b=10)
-                )
-                st.plotly_chart(fig_bar_sub, use_container_width=True, key="chart_taxa_substancias")
-
-            with col_tab_sub:
-                # Tabela resumo
-                df_table_sub = df_substance.sort_values("Positivos", ascending=False).copy()
-                df_table_sub["Positivos"] = df_table_sub["Positivos"].apply(lambda x: f"{x:,}".replace(",", "."))
-                df_table_sub["Total"] = df_table_sub["Total"].apply(lambda x: f"{x:,}".replace(",", "."))
-                df_table_sub["Taxa (%)"] = df_table_sub["Taxa (%)"].apply(lambda x: f"{x:.2f}%")
-                df_table_sub["% do Total"] = df_table_sub["% do Total"].apply(lambda x: f"{x:.1f}%")
-
-                st.markdown("**Resumo por Substância**")
-                st.dataframe(
-                    df_table_sub[["Substância", "Positivos", "Taxa (%)", "% do Total"]],
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(400, len(df_table_sub) * 35 + 40)
-                )
-        else:
-            st.info("Nenhuma amostra positiva encontrada para o período selecionado")
-    else:
-        st.info("Carregando dados de substâncias...")
-
-    st.markdown("---")
-
-    # Segunda linha: Estado e Finalidade
-    col_geo, col_purpose = st.columns(2)
-
-    with col_geo:
-        st.markdown("#### Positividade por Estado")
-        if state_data:
-            df_state = pd.DataFrame([
-                {"Estado": k, "Total": v["total"], "Positivos": v["positivo"], "Taxa": v["taxa"]}
-                for k, v in state_data.items()
-            ])
-            df_state = df_state.sort_values("Total", ascending=True)
-
-            # Texto mostrando total e taxa
-            df_state["Texto"] = df_state.apply(
-                lambda row: f"{row['Total']:,} ({row['Taxa']:.1f}%)".replace(",", "."), axis=1
-            )
-
-            fig_state = px.bar(
-                df_state,
-                x='Total',
-                y='Estado',
-                orientation='h',
-                title='Total de Amostras por Estado',
-                text='Texto',
-                color='Taxa',
-                color_continuous_scale=['#00CED1', '#1A1A2E']
-            )
-            fig_state.update_traces(textposition='outside', textfont_size=10)
-            fig_state.update_layout(
-                height=max(350, len(df_state) * 40),
-                xaxis_title="Total de Amostras",
-                yaxis_title="",
-                showlegend=False,
-                coloraxis_showscale=False
-            )
-            st.plotly_chart(fig_state, use_container_width=True, key="chart_taxa_estado")
-        else:
-            st.info("Nenhum dado de estado encontrado")
-
-    with col_purpose:
-        st.markdown("#### Positividade por Finalidade")
-        if purpose_data:
-            df_purpose = pd.DataFrame([
-                {"Finalidade": k, "Total": v["total"], "Positivos": v["positivo"], "Taxa": v["taxa"]}
-                for k, v in purpose_data.items()
-            ])
-            df_purpose = df_purpose.sort_values("Total", ascending=False)
-
-            # Texto mostrando total e taxa
-            df_purpose["Texto"] = df_purpose.apply(
-                lambda row: f"{row['Total']:,} ({row['Taxa']:.1f}%)".replace(",", "."), axis=1
-            )
-
-            fig_purpose = px.bar(
-                df_purpose,
-                x='Finalidade',
-                y='Total',
-                title='Total de Amostras por Finalidade',
-                text='Texto',
-                color='Taxa',
-                color_continuous_scale=['#00CED1', '#1A1A2E']
-            )
-            fig_purpose.update_traces(textposition='outside', textfont_size=10)
-            fig_purpose.update_layout(
-                height=400,
-                xaxis_title="",
-                yaxis_title="Total de Amostras",
-                xaxis_tickangle=-45,
-                showlegend=False,
-                coloraxis_showscale=False
-            )
-            st.plotly_chart(fig_purpose, use_container_width=True, key="chart_taxa_finalidade")
-        else:
-            st.info("Nenhum dado de finalidade encontrado")
-
-    st.markdown("---")
-
-    # Terceira linha: Tipo de Lote e Status RENACH
-    col_lot, col_renach = st.columns(2)
-
-    with col_lot:
-        st.markdown("#### Positividade por Tipo de Lote")
-        if lot_type_data:
-            df_lot = pd.DataFrame([
-                {"Tipo de Lote": k, "Total": v["total"], "Positivos": v["positivo"],
-                 "Negativos": v["negativo"], "Taxa": v["taxa"]}
-                for k, v in lot_type_data.items()
-            ])
-
-            # Texto mostrando total e taxa
-            df_lot["Texto"] = df_lot.apply(
-                lambda row: f"{row['Total']:,} ({row['Taxa']:.1f}%)".replace(",", "."), axis=1
-            )
-
-            # Gráfico de barras com total
-            fig_lot = px.bar(
-                df_lot,
-                x='Tipo de Lote',
-                y='Total',
-                title='Total de Amostras por Tipo de Lote',
-                text='Texto',
-                color='Taxa',
-                color_continuous_scale=['#00CED1', '#1A1A2E']
-            )
-            fig_lot.update_traces(textposition='outside', textfont_size=11)
-            fig_lot.update_layout(
-                height=400,
-                xaxis_title="",
-                yaxis_title="Total de Amostras",
-                showlegend=False,
-                coloraxis_showscale=False
-            )
-            st.plotly_chart(fig_lot, use_container_width=True, key="chart_taxa_tipo_lote")
-
-            # Tabela com detalhes
-            df_lot_display = df_lot.copy()
-            df_lot_display['Taxa'] = df_lot_display['Taxa'].apply(lambda x: f"{x:.2f}%")
-            df_lot_display['Total'] = df_lot_display['Total'].apply(lambda x: f"{x:,}".replace(",", "."))
-            df_lot_display['Positivos'] = df_lot_display['Positivos'].apply(lambda x: f"{x:,}".replace(",", "."))
-            df_lot_display['Negativos'] = df_lot_display['Negativos'].apply(lambda x: f"{x:,}".replace(",", "."))
-            st.dataframe(df_lot_display[['Tipo de Lote', 'Total', 'Positivos', 'Negativos', 'Taxa']], use_container_width=True, hide_index=True)
-        else:
-            st.info("Nenhum dado de tipo de lote encontrado")
-
-    with col_renach:
-        st.markdown("#### Positividade por Status RENACH")
-        if renach_status_data:
-            df_renach = pd.DataFrame([
-                {"Status RENACH": k, "Total": v["total"], "Positivos": v["positivo"],
-                 "Negativos": v["negativo"], "Taxa": v["taxa"]}
-                for k, v in renach_status_data.items()
-            ])
-
-            # Texto mostrando total e taxa
-            df_renach["Texto"] = df_renach.apply(
-                lambda row: f"{row['Total']:,} ({row['Taxa']:.1f}%)".replace(",", "."), axis=1
-            )
-
-            # Gráfico de barras com total
-            fig_renach = px.bar(
-                df_renach,
-                x='Status RENACH',
-                y='Total',
-                title='Total de Amostras por Status RENACH',
-                text='Texto',
-                color='Status RENACH',
-                color_discrete_map={'No RENACH': '#00CED1', 'Fora do RENACH': '#1A1A2E'}
-            )
-            fig_renach.update_traces(textposition='outside', textfont_size=11)
-            fig_renach.update_layout(
-                height=400,
-                xaxis_title="",
-                yaxis_title="Total de Amostras",
-                showlegend=False
-            )
-            st.plotly_chart(fig_renach, use_container_width=True, key="chart_taxa_renach_status")
-
-            # Tabela com detalhes
-            df_renach_display = df_renach.copy()
-            df_renach_display['Taxa'] = df_renach_display['Taxa'].apply(lambda x: f"{x:.2f}%")
-            df_renach_display['Total'] = df_renach_display['Total'].apply(lambda x: f"{x:,}".replace(",", "."))
-            df_renach_display['Positivos'] = df_renach_display['Positivos'].apply(lambda x: f"{x:,}".replace(",", "."))
-            df_renach_display['Negativos'] = df_renach_display['Negativos'].apply(lambda x: f"{x:,}".replace(",", "."))
-            st.dataframe(df_renach_display[['Status RENACH', 'Total', 'Positivos', 'Negativos', 'Taxa']], use_container_width=True, hide_index=True)
-        else:
-            st.info("Nenhum dado de status RENACH encontrado")
-
-
-def render_substancias():
-    """
-    Página 2 - Substâncias: ranking, frequência e positividade
-    """
-    st.title("🧪 Substâncias")
-
-    # Filtros
-    st.markdown("### 🔍 Filtros")
-    col_f1, col_f2 = st.columns(2)
-
-    with col_f1:
-        labs_by_cnpj = get_laboratories_by_cnpj()
-        cnpj_options = ["Todos"] + sorted(labs_by_cnpj.keys())
-
-        selected_cnpj = st.selectbox(
-            "CNPJ Laboratório",
-            options=cnpj_options,
-            index=0,
-            key="subst_lab"
-        )
-
-        if selected_cnpj and selected_cnpj != "Todos":
-            lab_info = labs_by_cnpj.get(selected_cnpj, {})
-            selected_lab_id = lab_info.get("id")
-            selected_lab_name = lab_info.get("name", "")
-            selected_lab_city = lab_info.get("city", "")
-            selected_lab_state = lab_info.get("state", "")
-        else:
-            selected_lab_id = None
-            selected_lab_name = None
-            selected_lab_city = None
-            selected_lab_state = None
-
-    with col_f2:
-        analysis_options = {
-            "Todos": "all",
-            "Triagem": "screening",
-            "Confirmatório": "confirmatory",
-            "Confirmatório THC": "confirmatoryTHC",
-            "Contra Prova": "againstProof"
-        }
-        selected_analysis_name = st.selectbox(
-            "Tipo de Análise",
-            options=list(analysis_options.keys()),
-            index=0,
-            key="subst_analysis"
-        )
-        selected_analysis = analysis_options[selected_analysis_name]
-
-    # Exibir informações do laboratório selecionado
-    if selected_lab_name:
-        location_info = f"{selected_lab_city}/{selected_lab_state}" if selected_lab_city and selected_lab_state else ""
-        st.success(f"🏢 **{selected_lab_name}** {f'({location_info})' if location_info else ''}")
-
-    st.markdown("---")
-
-    substance_stats = loading_single(
-        get_substance_statistics, "Carregando dados de substâncias...",
-        selected_lab_id, None, selected_analysis
-    )
-
-    if not substance_stats:
-        st.warning("Nenhum dado encontrado para os filtros selecionados")
-        return
-
-    # Preparar dados para visualização
-    # Total de amostras é calculado usando qualquer substância (todas têm o mesmo total)
-    # pois todas as substâncias são analisadas em cada amostra
-    primeira_substancia = list(substance_stats.values())[0]
-    total_amostras = primeira_substancia["total"]
-
-    df_stats = pd.DataFrame([
-        {
-            "Substância": name,
-            "Positivos": data["positivos"],
-            "Taxa Positividade (%)": round(data["positivos"] / total_amostras * 100, 2) if total_amostras > 0 else 0
-        }
-        for name, data in substance_stats.items()
-    ])
-
-    # Ordenar por taxa de positividade (maior primeiro)
-    df_stats = df_stats.sort_values("Taxa Positividade (%)", ascending=False)
-
-    # Cards de substâncias ordenados por taxa de positividade
-    st.subheader("🧪 Substâncias por Taxa de Positividade")
-    st.caption(f"Total de amostras analisadas: **{total_amostras:,}**".replace(",", "."))
-
-    # Mostrar cards em grid (4 por linha)
-    substancias_com_positivos = df_stats[df_stats["Positivos"] > 0]
-
-    if not substancias_com_positivos.empty:
-        # Criar linhas de 4 cards
-        for i in range(0, len(substancias_com_positivos), 4):
-            cols = st.columns(4)
-            for j, col in enumerate(cols):
-                idx = i + j
-                if idx < len(substancias_com_positivos):
-                    row = substancias_com_positivos.iloc[idx]
-                    with col:
-                        st.metric(
-                            label=row["Substância"],
-                            value=f"{row['Taxa Positividade (%)']:.2f}%",
-                            delta=f"{int(row['Positivos'])} positivos",
-                            delta_color="inverse"
-                        )
-    else:
-        st.info("Nenhuma substância com resultado positivo no período")
-
-
 def get_demographic_raw_data(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> pd.DataFrame:
     """
     Retorna dados demográficos brutos para análise.
@@ -7150,6 +6474,8 @@ def render_tabela_detalhada():
             lab_has_avg = len(avg_data_lab) > 0
             lab_avg_status = "✅ Média disponível" if lab_has_avg else "⚠️ Sem dados de média no período"
             st.info(f"🏢 **Laboratório:** {lab_info['lab_name']} {f'({lab_location})' if lab_location else ''} | {lab_avg_status}")
+        else:
+            st.warning(f"⚠️ Não foi possível identificar o laboratório da amostra {amostra_code}")
 
         if concentration_data:
             # Filtrar apenas substâncias positivas na amostra
@@ -7598,6 +6924,7 @@ def render_auditoria():
 def detect_anomalies() -> dict:
     """
     Detecta anomalias nos dados.
+    Otimizado para usar dados agregados em vez de consultas individuais por laboratório.
     """
     cache_key = "anomalies_detection"
     cached = get_cached_data("anomalies", cache_key)
@@ -7612,14 +6939,16 @@ def detect_anomalies() -> dict:
     }
 
     try:
-        # 1. Verificar taxas extremas por laboratório
+        # 1. Verificar taxas extremas por laboratório usando dados agregados
+        # Em vez de chamar get_metrics_data para cada lab, usar get_positivity_by_laboratory
+        start_date, end_date = get_selected_period()
+        lab_data = get_positivity_by_laboratory(start_date, end_date)
         labs_map = get_laboratories_map()
 
-        for lab_id, lab_name in labs_map.items():
-            metrics = get_metrics_data(laboratory_ids=[lab_id])
-
-            total = metrics.get("total_amostras", 0)
-            taxa = metrics.get("taxa_geral", 0)
+        for lab_id, data in lab_data.items():
+            lab_name = labs_map.get(lab_id, "Desconhecido")
+            total = data.get("total", 0)
+            taxa = data.get("taxa", 0)
 
             if total > 100:  # Mínimo de amostras para considerar
                 if taxa > 25:  # Taxa muito alta
