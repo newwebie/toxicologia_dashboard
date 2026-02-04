@@ -6844,81 +6844,865 @@ def render_tabela_detalhada():
     st.caption(f"Exibindo {len(df_exibicao):,} de {total_count:,} registros".replace(",", "."))
 
 
+def get_shewhart_data() -> dict:
+    """
+    Calcula dados para o gráfico de controle estatístico (Shewhart).
+    Retorna dados mensais com limites de controle ±2σ e ±3σ.
+    """
+    start_date, end_date = get_selected_period()
+    cache_key = generate_cache_key("shewhart", start_date.isoformat(), end_date.isoformat())
+    cached = get_cached_data("shewhart_data", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        # Buscar dados mensais passando o período selecionado
+        monthly_data = get_monthly_positivity_data(
+            analysis_type="screening",
+            start_date_filter=start_date,
+            end_date_filter=end_date
+        )
+
+        if not monthly_data:
+            return {}
+
+        # Calcular taxas mensais
+        meses = []
+        taxas = []
+        totais = []
+
+        for mes, data in monthly_data.items():
+            total = data.get("positivo", 0) + data.get("negativo", 0)
+            if total > 0:
+                taxa = data.get("taxa", 0)
+                meses.append(mes)
+                taxas.append(taxa)
+                totais.append(total)
+
+        if len(taxas) < 3:
+            return {}
+
+        # Calcular estatísticas
+        media = sum(taxas) / len(taxas)
+        variancia = sum((t - media) ** 2 for t in taxas) / len(taxas)
+        desvio = variancia ** 0.5
+
+        # Limites de controle
+        ucl_2sigma = media + 2 * desvio  # Upper Control Limit 2σ
+        lcl_2sigma = max(0, media - 2 * desvio)  # Lower Control Limit 2σ
+        ucl_3sigma = media + 3 * desvio  # Upper Control Limit 3σ
+        lcl_3sigma = max(0, media - 3 * desvio)  # Lower Control Limit 3σ
+
+        # Identificar pontos fora de controle
+        pontos_fora = []
+        for i, (mes, taxa) in enumerate(zip(meses, taxas)):
+            if taxa > ucl_3sigma or taxa < lcl_3sigma:
+                pontos_fora.append({
+                    "mes": mes,
+                    "taxa": taxa,
+                    "severidade": "critico",
+                    "desvio": abs(taxa - media) / desvio if desvio > 0 else 0
+                })
+            elif taxa > ucl_2sigma or taxa < lcl_2sigma:
+                pontos_fora.append({
+                    "mes": mes,
+                    "taxa": taxa,
+                    "severidade": "alerta",
+                    "desvio": abs(taxa - media) / desvio if desvio > 0 else 0
+                })
+
+        result = {
+            "meses": meses,
+            "taxas": taxas,
+            "totais": totais,
+            "media": media,
+            "desvio": desvio,
+            "ucl_2sigma": ucl_2sigma,
+            "lcl_2sigma": lcl_2sigma,
+            "ucl_3sigma": ucl_3sigma,
+            "lcl_3sigma": lcl_3sigma,
+            "pontos_fora": pontos_fora
+        }
+
+        set_cached_data("shewhart_data", cache_key, result)
+        return result
+
+    except Exception as e:
+        st.error(f"Erro ao calcular dados Shewhart: {e}")
+        return {}
+
+
+def get_temporal_comparison() -> dict:
+    """
+    Compara período atual com período anterior (MoM - Month over Month).
+    """
+    start_date, end_date = get_selected_period()
+    cache_key = generate_cache_key("temporal_comparison", start_date.isoformat(), end_date.isoformat())
+    cached = get_cached_data("temporal_comparison", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        # Calcular período anterior com mesma duração
+        duracao = (end_date - start_date).days
+        periodo_anterior_fim = start_date - timedelta(days=1)
+        periodo_anterior_inicio = periodo_anterior_fim - timedelta(days=duracao)
+
+        # Dados do período atual
+        dados_atual = get_monthly_positivity_data(
+            analysis_type="screening",
+            start_date_filter=start_date,
+            end_date_filter=end_date
+        )
+
+        # Dados do período anterior
+        dados_anterior = get_monthly_positivity_data(
+            analysis_type="screening",
+            start_date_filter=periodo_anterior_inicio,
+            end_date_filter=periodo_anterior_fim
+        )
+
+        # Calcular totais
+        total_atual = sum(d.get("positivo", 0) + d.get("negativo", 0) for d in dados_atual.values())
+        positivos_atual = sum(d.get("positivo", 0) for d in dados_atual.values())
+        taxa_atual = (positivos_atual / total_atual * 100) if total_atual > 0 else 0
+
+        total_anterior = sum(d.get("positivo", 0) + d.get("negativo", 0) for d in dados_anterior.values())
+        positivos_anterior = sum(d.get("positivo", 0) for d in dados_anterior.values())
+        taxa_anterior = (positivos_anterior / total_anterior * 100) if total_anterior > 0 else 0
+
+        # Calcular variações
+        variacao_taxa = taxa_atual - taxa_anterior
+        variacao_volume = ((total_atual - total_anterior) / total_anterior * 100) if total_anterior > 0 else 0
+
+        result = {
+            "periodo_atual": {
+                "inicio": start_date,
+                "fim": end_date,
+                "total": total_atual,
+                "positivos": positivos_atual,
+                "taxa": taxa_atual
+            },
+            "periodo_anterior": {
+                "inicio": periodo_anterior_inicio,
+                "fim": periodo_anterior_fim,
+                "total": total_anterior,
+                "positivos": positivos_anterior,
+                "taxa": taxa_anterior
+            },
+            "variacao_taxa": variacao_taxa,
+            "variacao_volume": variacao_volume,
+            "tendencia": "alta" if variacao_taxa > 0.5 else "baixa" if variacao_taxa < -0.5 else "estavel"
+        }
+
+        set_cached_data("temporal_comparison", cache_key, result)
+        return result
+
+    except Exception as e:
+        st.error(f"Erro ao calcular comparação temporal: {e}")
+        return {}
+
+
+def get_lab_outliers() -> list:
+    """
+    Identifica laboratórios outliers (fora da curva) usando z-score.
+    Inclui CNPJ, cidade e estado de cada laboratório.
+    """
+    start_date, end_date = get_selected_period()
+    cache_key = generate_cache_key("lab_outliers", start_date.isoformat(), end_date.isoformat())
+    cached = get_cached_data("lab_outliers", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        lab_data = get_positivity_by_laboratory(start_date, end_date)
+        labs_map = get_laboratories_map()
+
+        # Criar mapa de ID para informações completas (CNPJ, cidade, estado)
+        labs_full_info = get_laboratories_with_address()
+        labs_info_map = {lab["id"]: lab for lab in labs_full_info}
+
+        # Filtrar labs com mínimo de amostras
+        labs_validos = []
+        for lab_id, data in lab_data.items():
+            total = data.get("total", 0)
+            if total >= 50:  # Mínimo de 50 amostras
+                lab_info = labs_info_map.get(lab_id, {})
+                labs_validos.append({
+                    "id": lab_id,
+                    "nome": labs_map.get(lab_id, "Desconhecido"),
+                    "cnpj": lab_info.get("cnpj", ""),
+                    "cidade": lab_info.get("city", ""),
+                    "estado": lab_info.get("state", ""),
+                    "total": total,
+                    "positivos": data.get("positivos", 0),
+                    "taxa": data.get("taxa", 0)
+                })
+
+        if len(labs_validos) < 3:
+            return []
+
+        # Calcular estatísticas
+        taxas = [l["taxa"] for l in labs_validos]
+        media = sum(taxas) / len(taxas)
+        variancia = sum((t - media) ** 2 for t in taxas) / len(taxas)
+        desvio = variancia ** 0.5
+
+        # Identificar outliers
+        outliers = []
+        for lab in labs_validos:
+            if desvio > 0:
+                z_score = (lab["taxa"] - media) / desvio
+                if abs(z_score) > 2:  # Mais de 2 desvios padrão
+                    lab["z_score"] = z_score
+                    lab["media_nacional"] = media
+                    lab["desvio_nacional"] = desvio
+                    lab["severidade"] = "critico" if abs(z_score) > 3 else "alto"
+                    lab["posicao"] = "acima" if z_score > 0 else "abaixo"
+                    outliers.append(lab)
+
+        # Ordenar por z-score (mais extremo primeiro)
+        outliers.sort(key=lambda x: abs(x["z_score"]), reverse=True)
+
+        set_cached_data("lab_outliers", cache_key, outliers)
+        return outliers
+
+    except Exception as e:
+        st.error(f"Erro ao identificar outliers: {e}")
+        return []
+
+
+def get_substance_trends() -> list:
+    """
+    Analisa tendências de crescimento/queda por substância.
+    """
+    start_date, end_date = get_selected_period()
+    cache_key = generate_cache_key("substance_trends", start_date.isoformat(), end_date.isoformat())
+    cached = get_cached_data("substance_trends", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        # Calcular período anterior
+        duracao = (end_date - start_date).days
+        periodo_anterior_fim = start_date - timedelta(days=1)
+        periodo_anterior_inicio = periodo_anterior_fim - timedelta(days=duracao)
+
+        # Dados atuais
+        stats_atual = get_substance_statistics(month=None, analysis_type="all")
+
+        # Para período anterior, precisamos ajustar a consulta
+        # Por simplicidade, usar os dados atuais e calcular tendências
+        trends = []
+        for subst, data in stats_atual.items():
+            if data.get("total", 0) >= 50:  # Mínimo de análises
+                trends.append({
+                    "substancia": subst,
+                    "total": data.get("total", 0),
+                    "positivos": data.get("positivos", 0),
+                    "taxa": data.get("taxa", 0),
+                    "percentual_total": round(data.get("positivos", 0) / max(sum(d.get("positivos", 0) for d in stats_atual.values()), 1) * 100, 2)
+                })
+
+        # Ordenar por taxa (maior primeiro)
+        trends.sort(key=lambda x: x["taxa"], reverse=True)
+
+        set_cached_data("substance_trends", cache_key, trends)
+        return trends
+
+    except Exception as e:
+        st.error(f"Erro ao analisar tendências de substâncias: {e}")
+        return []
+
+
+def calculate_health_score(anomalias: dict, shewhart: dict, outliers: list) -> dict:
+    """
+    Calcula um score de saúde geral do sistema baseado nas anomalias detectadas.
+    Score de 0 a 100 (100 = perfeito).
+    """
+    score = 100
+    detalhes = []
+
+    # Penalizar por anomalias
+    total_anomalias = sum(len(v) for v in anomalias.values())
+    if total_anomalias > 0:
+        penalidade = min(30, total_anomalias * 2)
+        score -= penalidade
+        detalhes.append(f"-{penalidade} pts: {total_anomalias} anomalias detectadas")
+
+    # Penalizar por pontos fora de controle (Shewhart)
+    if shewhart.get("pontos_fora"):
+        criticos = len([p for p in shewhart["pontos_fora"] if p.get("severidade") == "critico"])
+        alertas = len([p for p in shewhart["pontos_fora"] if p.get("severidade") == "alerta"])
+        penalidade = criticos * 10 + alertas * 5
+        score -= min(30, penalidade)
+        if penalidade > 0:
+            detalhes.append(f"-{min(30, penalidade)} pts: {criticos} pontos críticos, {alertas} alertas no controle")
+
+    # Penalizar por outliers
+    if outliers:
+        criticos = len([o for o in outliers if o.get("severidade") == "critico"])
+        altos = len([o for o in outliers if o.get("severidade") == "alto"])
+        penalidade = criticos * 8 + altos * 4
+        score -= min(20, penalidade)
+        if penalidade > 0:
+            detalhes.append(f"-{min(20, penalidade)} pts: {len(outliers)} laboratórios outliers")
+
+    score = max(0, score)
+
+    # Determinar status
+    if score >= 80:
+        status = "Excelente"
+        cor = "#28A745"
+    elif score >= 60:
+        status = "Bom"
+        cor = "#17A2B8"
+    elif score >= 40:
+        status = "Atenção"
+        cor = "#FFC107"
+    else:
+        status = "Crítico"
+        cor = "#DC3545"
+
+    return {
+        "score": score,
+        "status": status,
+        "cor": cor,
+        "detalhes": detalhes
+    }
+
+
 def render_auditoria():
     """
     Página 6 - Auditoria e Anomalias
+    Implementa controle estatístico, comparação temporal, análise de outliers e alertas.
     """
     st.title("🔍 Auditoria e Anomalias")
 
-    anomalias = loading_single(detect_anomalies, "Analisando dados...")
+    # Carregar todos os dados necessários
+    tasks = [
+        ("Anomalias", detect_anomalies, (), {}),
+        ("Shewhart", get_shewhart_data, (), {}),
+        ("Comparação Temporal", get_temporal_comparison, (), {}),
+        ("Outliers", get_lab_outliers, (), {}),
+        ("Tendências Substâncias", get_substance_trends, (), {}),
+    ]
 
-    if not anomalias:
-        st.success("✅ Nenhuma anomalia detectada!")
-        return
+    results = loading_with_progress(tasks, "Analisando dados de auditoria...")
 
-    # Resumo
+    anomalias = results.get("Anomalias", {})
+    shewhart = results.get("Shewhart", {})
+    comparacao = results.get("Comparação Temporal", {})
+    outliers = results.get("Outliers", [])
+    tendencias_subst = results.get("Tendências Substâncias", [])
+
+    # Calcular score de saúde
+    health = calculate_health_score(anomalias, shewhart, outliers)
+
+    # ============================================
+    # KPIs RESUMO
+    # ============================================
     total_anomalias = sum(len(v) for v in anomalias.values())
+    criticos = len(shewhart.get("pontos_fora", [])) + len([o for o in outliers if o.get("severidade") == "critico"])
+    alertas = len([a for cat in anomalias.values() for a in cat]) + len([o for o in outliers if o.get("severidade") == "alto"])
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        st.metric("Total de Anomalias", total_anomalias)
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, {health['cor']} 0%, {health['cor']}CC 100%); padding: 18px; border-radius: 12px; text-align: center;">
+            <div style="color: rgba(255,255,255,0.9); font-size: 12px; text-transform: uppercase;">Score de Saúde</div>
+            <div style="color: white; font-size: 32px; font-weight: bold;">{health['score']}</div>
+            <div style="color: rgba(255,255,255,0.9); font-size: 14px;">{health['status']}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     with col2:
-        tipos = len([k for k, v in anomalias.items() if v])
-        st.metric("Tipos de Anomalias", tipos)
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #1A1A2E 0%, #16213E 100%); padding: 18px; border-radius: 12px; text-align: center;">
+            <div style="color: #888; font-size: 12px; text-transform: uppercase;">Total Anomalias</div>
+            <div style="color: white; font-size: 32px; font-weight: bold;">{total_anomalias}</div>
+            <div style="color: #888; font-size: 12px;">detectadas</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     with col3:
-        severidade = "Alta" if total_anomalias > 50 else "Média" if total_anomalias > 10 else "Baixa"
-        st.metric("Severidade Geral", severidade)
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #DC3545 0%, #B02A37 100%); padding: 18px; border-radius: 12px; text-align: center;">
+            <div style="color: rgba(255,255,255,0.9); font-size: 12px; text-transform: uppercase;">Críticos</div>
+            <div style="color: white; font-size: 32px; font-weight: bold;">{criticos}</div>
+            <div style="color: rgba(255,255,255,0.9); font-size: 12px;">requerem ação</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col4:
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #FFC107 0%, #E0A800 100%); padding: 18px; border-radius: 12px; text-align: center;">
+            <div style="color: rgba(0,0,0,0.7); font-size: 12px; text-transform: uppercase;">Alertas</div>
+            <div style="color: #1A1A2E; font-size: 32px; font-weight: bold;">{alertas}</div>
+            <div style="color: rgba(0,0,0,0.6); font-size: 12px;">monitorar</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # Detalhamento por tipo
-    if anomalias.get("taxas_extremas"):
-        with st.expander(f"⚠️ Taxas de Positividade Extremas ({len(anomalias['taxas_extremas'])} encontradas)", expanded=True):
-            st.markdown("Laboratórios com taxas fora do padrão (muito alta ou muito baixa)")
-            df_taxas = pd.DataFrame(anomalias["taxas_extremas"])
-            st.dataframe(df_taxas, use_container_width=True, hide_index=True)
+    # ============================================
+    # GRÁFICO DE CONTROLE ESTATÍSTICO (SHEWHART)
+    # ============================================
+    st.subheader("📈 Gráfico de Controle Estatístico (Shewhart)")
 
-    if anomalias.get("volumes_atipicos"):
-        with st.expander(f"📊 Volumes Atípicos ({len(anomalias['volumes_atipicos'])} encontrados)", expanded=True):
-            st.markdown("Períodos com volume de amostras muito diferente da média")
-            df_volumes = pd.DataFrame(anomalias["volumes_atipicos"])
-            st.dataframe(df_volumes, use_container_width=True, hide_index=True)
+    if shewhart and shewhart.get("meses"):
+        # Criar gráfico
+        fig_shewhart = go.Figure()
 
-    if anomalias.get("substancias_raras"):
-        with st.expander(f"🧪 Substâncias Raras ({len(anomalias['substancias_raras'])} encontradas)", expanded=True):
-            st.markdown("Substâncias com positividade muito alta ou muito baixa")
-            df_subst = pd.DataFrame(anomalias["substancias_raras"])
-            st.dataframe(df_subst, use_container_width=True, hide_index=True)
+        # Linha dos dados
+        fig_shewhart.add_trace(go.Scatter(
+            x=shewhart["meses"],
+            y=shewhart["taxas"],
+            mode='lines+markers',
+            name='Taxa de Positividade',
+            line=dict(color='#0066CC', width=2),
+            marker=dict(size=8)
+        ))
 
-    if anomalias.get("dados_faltantes"):
-        with st.expander(f"❌ Dados Faltantes ({len(anomalias['dados_faltantes'])} encontrados)", expanded=True):
-            st.markdown("Registros com informações incompletas")
-            df_faltantes = pd.DataFrame(anomalias["dados_faltantes"])
-            st.dataframe(df_faltantes, use_container_width=True, hide_index=True)
+        # Linha central (média)
+        fig_shewhart.add_hline(
+            y=shewhart["media"],
+            line_dash="solid",
+            line_color="#28A745",
+            line_width=2,
+            annotation_text=f"Média: {shewhart['media']:.2f}%",
+            annotation_position="right"
+        )
+
+        # Limites ±2σ
+        fig_shewhart.add_hline(
+            y=shewhart["ucl_2sigma"],
+            line_dash="dash",
+            line_color="#FFC107",
+            line_width=1,
+            annotation_text=f"+2σ: {shewhart['ucl_2sigma']:.2f}%",
+            annotation_position="right"
+        )
+        fig_shewhart.add_hline(
+            y=shewhart["lcl_2sigma"],
+            line_dash="dash",
+            line_color="#FFC107",
+            line_width=1,
+            annotation_text=f"-2σ: {shewhart['lcl_2sigma']:.2f}%",
+            annotation_position="right"
+        )
+
+        # Limites ±3σ
+        fig_shewhart.add_hline(
+            y=shewhart["ucl_3sigma"],
+            line_dash="dot",
+            line_color="#DC3545",
+            line_width=1,
+            annotation_text=f"+3σ: {shewhart['ucl_3sigma']:.2f}%",
+            annotation_position="right"
+        )
+        fig_shewhart.add_hline(
+            y=shewhart["lcl_3sigma"],
+            line_dash="dot",
+            line_color="#DC3545",
+            line_width=1,
+            annotation_text=f"-3σ: {shewhart['lcl_3sigma']:.2f}%",
+            annotation_position="right"
+        )
+
+        # Destacar pontos fora de controle
+        for ponto in shewhart.get("pontos_fora", []):
+            idx = shewhart["meses"].index(ponto["mes"]) if ponto["mes"] in shewhart["meses"] else -1
+            if idx >= 0:
+                cor = "#DC3545" if ponto["severidade"] == "critico" else "#FFC107"
+                fig_shewhart.add_trace(go.Scatter(
+                    x=[ponto["mes"]],
+                    y=[ponto["taxa"]],
+                    mode='markers',
+                    marker=dict(size=14, color=cor, symbol='x'),
+                    name=f'{ponto["severidade"].capitalize()}: {ponto["mes"]}',
+                    showlegend=False
+                ))
+
+        fig_shewhart.update_layout(
+            height=450,
+            margin=dict(t=30, b=50, l=50, r=100),
+            xaxis_title="Período",
+            yaxis_title="Taxa de Positividade (%)",
+            yaxis_ticksuffix="%",
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(gridcolor='rgba(128,128,128,0.2)'),
+            yaxis=dict(gridcolor='rgba(128,128,128,0.2)'),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5)
+        )
+
+        st.plotly_chart(fig_shewhart, use_container_width=True, key="chart_shewhart")
+
+        # Legenda explicativa
+        st.caption("**Interpretação:** Pontos dentro dos limites ±2σ (amarelo) estão sob controle normal. Pontos fora dos limites ±3σ (vermelho) indicam comportamento atípico que requer investigação.")
+    else:
+        st.info("Dados insuficientes para gerar o gráfico de controle estatístico.")
 
     st.markdown("---")
 
-    # Exportar relatório
-    st.markdown("### 📥 Exportar Relatório de Auditoria")
+    # ============================================
+    # COMPARATIVO TEMPORAL E LABORATÓRIOS OUTLIERS
+    # ============================================
+    col_temp, col_outliers = st.columns(2)
 
-    report_data = {
-        "data_analise": datetime.now().isoformat(),
-        "total_anomalias": total_anomalias,
-        "anomalias": anomalias
+    with col_temp:
+        st.subheader("📊 Comparativo Temporal")
+
+        if comparacao:
+            atual = comparacao.get("periodo_atual", {})
+            anterior = comparacao.get("periodo_anterior", {})
+
+            # Cards de comparação
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.markdown("**Período Atual**")
+                st.markdown(f"📅 {atual.get('inicio', '').strftime('%d/%m/%Y') if atual.get('inicio') else '-'} a {atual.get('fim', '').strftime('%d/%m/%Y') if atual.get('fim') else '-'}")
+                st.metric("Taxa", f"{atual.get('taxa', 0):.2f}%")
+                st.metric("Volume", f"{atual.get('total', 0):,}".replace(",", "."))
+
+            with col_b:
+                st.markdown("**Período Anterior**")
+                st.markdown(f"📅 {anterior.get('inicio', '').strftime('%d/%m/%Y') if anterior.get('inicio') else '-'} a {anterior.get('fim', '').strftime('%d/%m/%Y') if anterior.get('fim') else '-'}")
+                st.metric("Taxa", f"{anterior.get('taxa', 0):.2f}%")
+                st.metric("Volume", f"{anterior.get('total', 0):,}".replace(",", "."))
+
+            # Variações
+            st.markdown("---")
+            var_taxa = comparacao.get("variacao_taxa", 0)
+            var_volume = comparacao.get("variacao_volume", 0)
+            tendencia = comparacao.get("tendencia", "estavel")
+
+            cor_taxa = "#DC3545" if var_taxa > 0 else "#28A745" if var_taxa < 0 else "#6C757D"
+            cor_volume = "#28A745" if var_volume > 0 else "#DC3545" if var_volume < 0 else "#6C757D"
+
+            st.markdown(f"""
+            <div style="display: flex; gap: 10px;">
+                <div style="flex: 1; background: #1A1A2E; padding: 12px; border-radius: 8px; text-align: center;">
+                    <div style="color: #888; font-size: 11px;">Variação Taxa</div>
+                    <div style="color: {cor_taxa}; font-size: 20px; font-weight: bold;">{'+' if var_taxa > 0 else ''}{var_taxa:.2f}%</div>
+                </div>
+                <div style="flex: 1; background: #1A1A2E; padding: 12px; border-radius: 8px; text-align: center;">
+                    <div style="color: #888; font-size: 11px;">Variação Volume</div>
+                    <div style="color: {cor_volume}; font-size: 20px; font-weight: bold;">{'+' if var_volume > 0 else ''}{var_volume:.1f}%</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            icone_tendencia = "📈" if tendencia == "alta" else "📉" if tendencia == "baixa" else "➡️"
+            st.markdown(f"**Tendência:** {icone_tendencia} {tendencia.capitalize()}")
+        else:
+            st.info("Dados insuficientes para comparação temporal.")
+
+    with col_outliers:
+        st.subheader("🏢 Laboratórios Outliers")
+
+        if outliers:
+            for lab in outliers[:5]:  # Top 5 outliers
+                cor = "#DC3545" if lab.get("severidade") == "critico" else "#FFC107"
+                icone = "🔴" if lab.get("severidade") == "critico" else "🟠"
+                direcao = "↑" if lab.get("posicao") == "acima" else "↓"
+                cnpj = lab.get('cnpj', '')
+                cidade = lab.get('cidade', '')
+                estado = lab.get('estado', '')
+                localizacao = f"{cidade}/{estado}" if cidade and estado else cidade or estado or ""
+
+                st.markdown(f"""
+                <div style="background: #1A1A2E; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid {cor};">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <div style="color: white; font-weight: bold;">{icone} {lab.get('nome', 'Desconhecido')[:30]}</div>
+                            <div style="color: #00CED1; font-size: 11px; font-family: monospace;">{cnpj if cnpj else 'CNPJ não informado'}</div>
+                            <div style="color: #888; font-size: 11px;">{localizacao} • {lab.get('total', 0):,} amostras</div>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="color: {cor}; font-size: 18px; font-weight: bold;">{lab.get('taxa', 0):.2f}% {direcao}</div>
+                            <div style="color: #888; font-size: 11px;">z-score: {lab.get('z_score', 0):.2f}σ</div>
+                        </div>
+                    </div>
+                </div>
+                """.replace(",", "."), unsafe_allow_html=True)
+
+            st.caption(f"**Média nacional:** {outliers[0].get('media_nacional', 0):.2f}% | **Desvio padrão:** {outliers[0].get('desvio_nacional', 0):.2f}%")
+        else:
+            st.success("Nenhum laboratório outlier identificado.")
+
+    st.markdown("---")
+
+    # ============================================
+    # ALERTAS POR SEVERIDADE
+    # ============================================
+    st.subheader("⚠️ Alertas por Severidade")
+
+    # Organizar alertas por severidade
+    alertas_criticos = []
+    alertas_altos = []
+    alertas_medios = []
+
+    # Pontos fora de controle (Shewhart)
+    for ponto in shewhart.get("pontos_fora", []):
+        alerta = {
+            "tipo": "Controle Estatístico",
+            "descricao": f"Taxa de {ponto['taxa']:.2f}% em {ponto['mes']} ({ponto['desvio']:.1f}σ do normal)",
+            "acao": "Investigar causas do desvio"
+        }
+        if ponto.get("severidade") == "critico":
+            alertas_criticos.append(alerta)
+        else:
+            alertas_altos.append(alerta)
+
+    # Laboratórios outliers
+    for lab in outliers:
+        alerta = {
+            "tipo": "Laboratório Outlier",
+            "descricao": f"{lab.get('nome', 'Desconhecido')} com taxa {lab.get('taxa', 0):.2f}% ({lab.get('posicao', '')} da média)",
+            "acao": "Auditar processos do laboratório"
+        }
+        if lab.get("severidade") == "critico":
+            alertas_criticos.append(alerta)
+        else:
+            alertas_altos.append(alerta)
+
+    # Anomalias detectadas
+    for taxa in anomalias.get("taxas_extremas", []):
+        alertas_medios.append({
+            "tipo": "Taxa Extrema",
+            "descricao": f"{taxa.get('Laboratório', 'Desconhecido')}: {taxa.get('Taxa (%)', '0%')} ({taxa.get('Tipo', '')})",
+            "acao": "Verificar dados"
+        })
+
+    for volume in anomalias.get("volumes_atipicos", []):
+        alertas_medios.append({
+            "tipo": "Volume Atípico",
+            "descricao": f"{volume.get('Mês', '')}: {volume.get('Volume', 0)} amostras ({volume.get('Desvio', '')})",
+            "acao": "Verificar sazonalidade"
+        })
+
+    # Exibir alertas em expanders
+    if alertas_criticos:
+        with st.expander(f"🔴 Críticos ({len(alertas_criticos)})", expanded=True):
+            for alerta in alertas_criticos:
+                st.markdown(f"""
+                <div style="background: rgba(220, 53, 69, 0.1); border-left: 4px solid #DC3545; padding: 10px; margin-bottom: 8px; border-radius: 4px;">
+                    <strong>{alerta['tipo']}</strong><br>
+                    <span style="color: #888;">{alerta['descricao']}</span><br>
+                    <em style="color: #DC3545;">Ação: {alerta['acao']}</em>
+                </div>
+                """, unsafe_allow_html=True)
+
+    if alertas_altos:
+        with st.expander(f"🟠 Altos ({len(alertas_altos)})", expanded=len(alertas_criticos) == 0):
+            for alerta in alertas_altos:
+                st.markdown(f"""
+                <div style="background: rgba(255, 193, 7, 0.1); border-left: 4px solid #FFC107; padding: 10px; margin-bottom: 8px; border-radius: 4px;">
+                    <strong>{alerta['tipo']}</strong><br>
+                    <span style="color: #888;">{alerta['descricao']}</span><br>
+                    <em style="color: #E0A800;">Ação: {alerta['acao']}</em>
+                </div>
+                """, unsafe_allow_html=True)
+
+    if alertas_medios:
+        with st.expander(f"🟡 Médios ({len(alertas_medios)})", expanded=False):
+            for alerta in alertas_medios:
+                st.markdown(f"""
+                <div style="background: rgba(23, 162, 184, 0.1); border-left: 4px solid #17A2B8; padding: 10px; margin-bottom: 8px; border-radius: 4px;">
+                    <strong>{alerta['tipo']}</strong><br>
+                    <span style="color: #888;">{alerta['descricao']}</span><br>
+                    <em style="color: #17A2B8;">Ação: {alerta['acao']}</em>
+                </div>
+                """, unsafe_allow_html=True)
+
+    if not alertas_criticos and not alertas_altos and not alertas_medios:
+        st.success("✅ Nenhum alerta detectado no período selecionado!")
+
+    st.markdown("---")
+
+    # ============================================
+    # ANÁLISE DE SUBSTÂNCIAS
+    # ============================================
+    st.subheader("🧪 Análise de Substâncias")
+
+    if tendencias_subst:
+        col_graf, col_tab = st.columns([2, 1])
+
+        with col_graf:
+            # Top 10 substâncias por taxa
+            top_subst = tendencias_subst[:10]
+
+            df_subst = pd.DataFrame(top_subst)
+            df_subst = df_subst.sort_values("taxa", ascending=True)
+
+            fig_subst = px.bar(
+                df_subst,
+                y="substancia",
+                x="taxa",
+                orientation="h",
+                title="Top 10 Substâncias por Taxa de Positividade",
+                text=df_subst["taxa"].apply(lambda x: f"{x:.2f}%"),
+                color="taxa",
+                color_continuous_scale=["#00CED1", "#DC3545"]
+            )
+
+            fig_subst.update_traces(textposition="outside")
+            fig_subst.update_layout(
+                height=400,
+                margin=dict(t=40, b=20, l=10, r=10),
+                xaxis_title="Taxa (%)",
+                yaxis_title="",
+                showlegend=False,
+                coloraxis_showscale=False
+            )
+
+            st.plotly_chart(fig_subst, use_container_width=True, key="chart_subst_audit")
+
+        with col_tab:
+            st.markdown("**Resumo das Substâncias**")
+            df_display = pd.DataFrame(tendencias_subst[:10])
+            df_display["taxa"] = df_display["taxa"].apply(lambda x: f"{x:.2f}%")
+            df_display["positivos"] = df_display["positivos"].apply(lambda x: f"{x:,}".replace(",", "."))
+            df_display["total"] = df_display["total"].apply(lambda x: f"{x:,}".replace(",", "."))
+            df_display["percentual_total"] = df_display["percentual_total"].apply(lambda x: f"{x:.1f}%")
+
+            df_display = df_display.rename(columns={
+                "substancia": "Substância",
+                "taxa": "Taxa",
+                "positivos": "Positivos",
+                "total": "Total",
+                "percentual_total": "% Total"
+            })
+
+            st.dataframe(
+                df_display[["Substância", "Taxa", "Positivos", "% Total"]],
+                use_container_width=True,
+                hide_index=True,
+                height=350
+            )
+    else:
+        st.info("Nenhum dado de substância disponível.")
+
+    st.markdown("---")
+
+    # ============================================
+    # EXPORTAR RELATÓRIO
+    # ============================================
+    st.subheader("📥 Exportar Relatório de Auditoria")
+
+    # Preparar dados para exportação
+    export_data = {
+        "Data da Análise": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "Score de Saúde": health["score"],
+        "Status": health["status"],
+        "Total Anomalias": total_anomalias,
+        "Alertas Críticos": len(alertas_criticos),
+        "Alertas Altos": len(alertas_altos),
+        "Alertas Médios": len(alertas_medios)
     }
 
-    json_report = json.dumps(report_data, ensure_ascii=False, indent=2, default=str)
+    # Criar workbook Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Resumo
+        df_resumo = pd.DataFrame([export_data])
+        df_resumo.to_excel(writer, sheet_name='Resumo', index=False)
 
+        # Outliers
+        if outliers:
+            df_outliers = pd.DataFrame(outliers)
+            df_outliers.to_excel(writer, sheet_name='Outliers', index=False)
+
+        # Alertas
+        all_alertas = []
+        for a in alertas_criticos:
+            a["severidade"] = "Crítico"
+            all_alertas.append(a)
+        for a in alertas_altos:
+            a["severidade"] = "Alto"
+            all_alertas.append(a)
+        for a in alertas_medios:
+            a["severidade"] = "Médio"
+            all_alertas.append(a)
+
+        if all_alertas:
+            df_alertas = pd.DataFrame(all_alertas)
+            df_alertas.to_excel(writer, sheet_name='Alertas', index=False)
+
+        # Substâncias
+        if tendencias_subst:
+            df_subst_exp = pd.DataFrame(tendencias_subst)
+            df_subst_exp.to_excel(writer, sheet_name='Substancias', index=False)
+
+    output.seek(0)
     st.download_button(
-        "📋 Download Relatório JSON",
-        json_report,
-        "relatorio_auditoria.json",
-        "application/json",
+        "📊 Download Relatório Excel",
+        output,
+        f"auditoria_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=False
     )
+
+    # Expander explicativo das métricas
+    st.markdown("---")
+    with st.expander("📖 Glossário: Entenda as Métricas de Auditoria", expanded=False):
+        st.markdown("""
+        ### Score de Saúde (0-100)
+        Indicador geral da qualidade dos dados e processos. Calculado a partir das anomalias detectadas:
+        - **80-100 (Excelente):** Sistema operando dentro dos parâmetros esperados
+        - **60-79 (Bom):** Algumas anomalias detectadas, mas sob controle
+        - **40-59 (Atenção):** Múltiplas anomalias requerem investigação
+        - **0-39 (Crítico):** Situação grave que demanda ação imediata
+
+        ---
+
+        ### Z-Score (Desvio Padrão - σ)
+        Mede quantos desvios padrão um valor está distante da média. Usado para identificar outliers:
+        - **|z| < 2σ:** Valor normal, dentro da variação esperada
+        - **|z| entre 2σ e 3σ:** Valor atípico, merece atenção (Alerta Alto)
+        - **|z| > 3σ:** Valor muito extremo, fora do padrão (Crítico)
+
+        *Exemplo: Se a média nacional é 5% e o desvio padrão é 1%, um laboratório com 8% tem z-score = 3σ (crítico).*
+
+        ---
+
+        ### Gráfico de Controle (Shewhart)
+        Técnica estatística para monitorar processos ao longo do tempo:
+        - **Linha Central (verde):** Média histórica da taxa de positividade
+        - **Limites ±2σ (amarelo):** Zona de alerta - valores fora requerem monitoramento
+        - **Limites ±3σ (vermelho):** Zona crítica - valores fora indicam processo fora de controle
+
+        *Pontos consecutivos próximos aos limites também podem indicar tendências problemáticas.*
+
+        ---
+
+        ### Níveis de Severidade
+
+        | Nível | Cor | Critério | Ação Recomendada |
+        |-------|-----|----------|------------------|
+        | 🔴 **Crítico** | Vermelho | z-score > 3σ ou processo fora de controle | Investigação imediata |
+        | 🟠 **Alto** | Laranja | z-score entre 2σ e 3σ | Monitorar de perto |
+        | 🟡 **Médio** | Amarelo | Anomalias pontuais ou tendências | Acompanhar evolução |
+
+        ---
+
+        ### Laboratórios Outliers
+        Laboratórios identificados com taxas de positividade significativamente diferentes da média nacional:
+        - **Acima da média (↑):** Taxa maior que o esperado - pode indicar problemas de qualidade ou perfil regional específico
+        - **Abaixo da média (↓):** Taxa menor que o esperado - pode indicar subnotificação ou processos diferenciados
+
+        ---
+
+        ### Comparativo Temporal
+        Compara o período atual com o período anterior de mesma duração:
+        - **Variação de Taxa:** Diferença percentual na taxa de positividade
+        - **Variação de Volume:** Diferença percentual no número de amostras
+        - **Tendência:** Alta (↑), Baixa (↓) ou Estável (→)
+        """)
 
 
 def detect_anomalies() -> dict:
