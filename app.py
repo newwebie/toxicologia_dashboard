@@ -145,7 +145,7 @@ def clear_cache(cache_name: str = None):
         st.session_state.data_cache = {}
 
 
-def loading_with_progress(tasks: list, message: str = "Carregando dados...", silent: bool = False):
+def loading_with_progress(tasks: list, message: str = "Carregando dados...", silent: bool = False, parallel: bool = False):
     """
     Executa uma lista de tarefas mostrando progress bar usando placeholder.
 
@@ -154,6 +154,7 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados...", sil
                ou [(nome, funcao), ...] para funções sem argumentos
         message: mensagem exibida durante o carregamento
         silent: se True, não mostra progress bar (carregamento silencioso)
+        parallel: se True, executa tarefas em paralelo com ThreadPoolExecutor
 
     Returns:
         dict com {nome: resultado}
@@ -164,7 +165,7 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados...", sil
     # Usar placeholder para evitar blur/dimming (só se não for silencioso)
     placeholder = st.empty() if not silent else None
 
-    for i, task in enumerate(tasks):
+    def _execute_task(task):
         if len(task) == 2:
             name, func = task
             args, kwargs = (), {}
@@ -174,24 +175,67 @@ def loading_with_progress(tasks: list, message: str = "Carregando dados...", sil
         else:
             name, func, args, kwargs = task
 
-        # Atualizar progress bar dentro do placeholder (só se não for silencioso)
-        if placeholder:
-            progress = (i) / total
-            placeholder.progress(progress, text=f"{message} ({name})")
+        if args and kwargs:
+            return name, func(*args, **kwargs)
+        elif args:
+            return name, func(*args)
+        elif kwargs:
+            return name, func(**kwargs)
+        else:
+            return name, func()
 
-        try:
-            if args and kwargs:
-                results[name] = func(*args, **kwargs)
-            elif args:
-                results[name] = func(*args)
-            elif kwargs:
-                results[name] = func(**kwargs)
+    if parallel and total > 1:
+        # Execução paralela com ThreadPoolExecutor
+        if placeholder:
+            placeholder.progress(0.1, text=f"{message}")
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(total, 6)) as executor:
+            futures = {executor.submit(_execute_task, task): task for task in tasks}
+            for future in as_completed(futures):
+                try:
+                    name, result = future.result()
+                    results[name] = result
+                except Exception as e:
+                    # Extrair nome da task original
+                    task = futures[future]
+                    name = task[0] if len(task) >= 1 else "desconhecido"
+                    results[name] = None
+                    if not silent:
+                        st.error(f"Erro ao carregar {name}: {e}")
+
+                completed += 1
+                if placeholder:
+                    placeholder.progress(completed / total, text=f"{message} ({completed}/{total})")
+    else:
+        # Execução sequencial (comportamento original)
+        for i, task in enumerate(tasks):
+            if len(task) == 2:
+                name, func = task
+                args, kwargs = (), {}
+            elif len(task) == 3:
+                name, func, args = task
+                kwargs = {}
             else:
-                results[name] = func()
-        except Exception as e:
-            results[name] = None
-            if not silent:
-                st.error(f"Erro ao carregar {name}: {e}")
+                name, func, args, kwargs = task
+
+            if placeholder:
+                progress = (i) / total
+                placeholder.progress(progress, text=f"{message} ({name})")
+
+            try:
+                if args and kwargs:
+                    results[name] = func(*args, **kwargs)
+                elif args:
+                    results[name] = func(*args)
+                elif kwargs:
+                    results[name] = func(**kwargs)
+                else:
+                    results[name] = func()
+            except Exception as e:
+                results[name] = None
+                if not silent:
+                    st.error(f"Erro ao carregar {name}: {e}")
 
     # Completar progress bar (só se não for silencioso)
     if placeholder:
@@ -653,7 +697,7 @@ def preload_all_data(silent: bool = False):
         "Endereços": get_laboratories_with_address,
     }
 
-    total_tasks = len(parallel_tasks) + 1  # +1 para Resultados (depende de Lotes)
+    total_tasks = len(parallel_tasks) + 2  # +1 Resultados (depende de Lotes) + 1 DataFrame unificado
     completed = 0
 
     # Criar placeholder para progress (se não silent)
@@ -696,12 +740,90 @@ def preload_all_data(silent: bool = False):
             st.error(f"Erro ao carregar Resultados: {e}")
 
     completed += 1
+
+    # Construir DataFrame unificado DEPOIS de Resultados (depende de todos os dados)
+    if progress_placeholder:
+        progress_placeholder.progress(
+            completed / total_tasks,
+            text="Construindo DataFrame unificado..."
+        )
+    try:
+        results["DataFrame"] = build_unified_dataframe(start_date, end_date)
+    except Exception as e:
+        results["DataFrame"] = None
+        if not silent:
+            st.error(f"Erro ao construir DataFrame: {e}")
+
+    completed += 1
     if progress_placeholder:
         progress_placeholder.progress(1.0, text="Dados carregados!")
-        time.sleep(0.3)
         progress_placeholder.empty()
 
     return results
+
+
+# ============================================
+# DATAFRAME UNIFICADO - Performance
+# ============================================
+
+def build_unified_dataframe(start_date=None, end_date=None) -> pd.DataFrame:
+    """
+    Constroi DataFrame unificado com todos os resultados enriquecidos com metadados.
+    Permite filtragem vetorizada (Pandas) em vez de loops Python sobre dicts.
+    ~10-50x mais rapido que iteracao manual.
+
+    Colunas: lot_code, analysisType, month, sample_code, positive,
+             chain_id, lab_id, purpose_type, subtype
+    """
+    if start_date is None or end_date is None:
+        start_date, end_date = get_selected_period()
+
+    cache_key = generate_cache_key("unified_df", start_date, end_date)
+    cached = get_cached_data("unified_df", cache_key)
+    if cached is not None:
+        return cached
+
+    lots_dict = get_all_lots(start_date, end_date)
+    results_dict = get_all_results(start_date, end_date)
+    gatherings_data = get_all_gatherings(start_date, end_date)
+    chain_to_code_map = get_chain_to_sample_map(start_date, end_date)
+
+    chain_to_lab = gatherings_data.get("chain_to_lab", {})
+    chain_to_purpose = gatherings_data.get("chain_to_purpose", {})
+    chain_to_subtype = gatherings_data.get("chain_to_subtype", {})
+
+    # Mapa reverso: sample_code -> chain_id
+    code_to_chain = {v: k for k, v in chain_to_code_map.items()}
+
+    rows = []
+    for lot_code, lot_data in lots_dict.items():
+        analysis_type = lot_data["analysisType"]
+        month = lot_data.get("month")
+
+        for sample in results_dict.get(lot_code, []):
+            sample_code = sample.get("_sample")
+            positive = sample.get("positive", False)
+
+            chain_id = code_to_chain.get(sample_code)
+            lab_id = chain_to_lab.get(chain_id, "") if chain_id else ""
+            purpose = chain_to_purpose.get(chain_id, "") if chain_id else ""
+            subtype = chain_to_subtype.get(chain_id, "") if chain_id else ""
+
+            rows.append((lot_code, analysis_type, month, sample_code, positive, chain_id, lab_id, purpose, subtype))
+
+    df = pd.DataFrame(rows, columns=[
+        "lot_code", "analysisType", "month", "sample_code",
+        "positive", "chain_id", "lab_id", "purpose_type", "subtype"
+    ])
+
+    # Garantir tipos corretos (evitar None/NaN em colunas criticas)
+    df["positive"] = df["positive"].fillna(False).astype(bool)
+    df["lab_id"] = df["lab_id"].fillna("").astype(str)
+    df["purpose_type"] = df["purpose_type"].fillna("").astype(str)
+    df["subtype"] = df["subtype"].fillna("").astype(str)
+
+    set_cached_data("unified_df", cache_key, df)
+    return df
 
 
 # ============================================
@@ -905,10 +1027,12 @@ def get_laboratories_by_cnpj() -> dict:
 
 # Mapeamento de finalidades (purpose.type no banco -> nome exibido)
 PURPOSE_MAP = {
+    "cnh": "CNH",
     "clt": "CLT",
     "cltCnh": "CLT + CNH",
     "civilService": "Concurso Público",
     "againstProof": "Contra Prova",
+    "other": "Outros",
 }
 
 
@@ -932,20 +1056,33 @@ def get_chain_to_sample_code_map(chain_ids: set) -> dict:
 
 
 @st.cache_data(ttl=300)
-def get_filtered_samples(laboratory_id: str = None, purpose_type: str = None) -> tuple:
+def get_filtered_samples(laboratory_id: str = None, purpose_type=None, subtype_filter=None) -> tuple:
     """
     Busca os IDs das amostras filtrados por laboratório e/ou finalidade.
     USA CACHE PRÉ-CARREGADO para performance.
+    purpose_type: str ou list de str (suporta múltiplas finalidades)
+    subtype_filter: str ou list de str (suporta múltiplas subfinalidades)
     """
-    if not laboratory_id and not purpose_type:
+    if not laboratory_id and not purpose_type and not subtype_filter:
         return None, None
 
     try:
+        # Normalizar purpose_type para lista
+        purpose_types = None
+        if purpose_type:
+            purpose_types = purpose_type if isinstance(purpose_type, list) else [purpose_type]
+
+        # Normalizar subtype_filter para lista
+        subtypes = None
+        if subtype_filter:
+            subtypes = subtype_filter if isinstance(subtype_filter, list) else [subtype_filter]
+
         # Usar dados pré-carregados com período selecionado
         start_date, end_date = get_selected_period()
         gatherings_data = get_all_gatherings(start_date, end_date)
         chain_to_lab = gatherings_data.get("chain_to_lab", {})
         chain_to_purpose = gatherings_data.get("chain_to_purpose", {})
+        chain_to_subtype = gatherings_data.get("chain_to_subtype", {})
         chain_to_code = get_chain_to_sample_map(start_date, end_date)
 
         chain_ids = set()
@@ -955,8 +1092,12 @@ def get_filtered_samples(laboratory_id: str = None, purpose_type: str = None) ->
             if laboratory_id and lab_id != laboratory_id:
                 continue
 
-            # Filtro de finalidade
-            if purpose_type and chain_to_purpose.get(chain_id) != purpose_type:
+            # Filtro de finalidade (suporta lista)
+            if purpose_types and chain_to_purpose.get(chain_id) not in purpose_types:
+                continue
+
+            # Filtro de subfinalidade (suporta lista)
+            if subtypes and chain_to_subtype.get(chain_id) not in subtypes:
                 continue
 
             chain_ids.add(chain_id)
@@ -1293,7 +1434,10 @@ def main():
 
         # Limpar cache se período mudou
         if periodo_mudou:
-            clear_cache()
+            clear_cache()  # Limpa session cache (contagens computadas)
+            # base_data_loaded = False forca preload_all_data no proximo render.
+            # Dados estaticos (labs, compostos) retornam do @st.cache_data instantaneamente.
+            # Apenas lots/results/gatherings/DataFrame sao recarregados do MongoDB.
             st.session_state.base_data_loaded = False
             st.rerun()
 
@@ -1418,7 +1562,8 @@ def get_substance_data() -> pd.DataFrame:
         tipos_map = {
             "cnh": "CNH",
             "clt": "CLT",
-            "cltCnh": "CLT + CNH"
+            "cltCnh": "CLT + CNH",
+            "other": "Outros"
         }
 
         subtipos_map = {
@@ -1615,7 +1760,8 @@ def get_substance_data_full(start_date: datetime, end_date: datetime) -> pd.Data
         tipos_map = {
             "cnh": "CNH",
             "clt": "CLT",
-            "cltCnh": "CLT + CNH"
+            "cltCnh": "CLT + CNH",
+            "other": "Outros"
         }
 
         subtipos_map = {
@@ -1796,7 +1942,8 @@ def get_substance_data_paginated(page: int = 1, page_size: int = 100, filters: d
         tipos_map = {
             "cnh": "CNH",
             "clt": "CLT",
-            "cltCnh": "CLT + CNH"
+            "cltCnh": "CLT + CNH",
+            "other": "Outros"
         }
 
         subtipos_map = {
@@ -2307,56 +2454,44 @@ def get_average_concentrations_by_lab(laboratory_id: str) -> dict:
         return {}
 
 
-def count_results_by_type(analysis_type: str, laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+def count_results_by_type(analysis_type: str, laboratory_id: str = None, month: int = None, purpose_type=None, subtype_filter=None) -> dict:
     """
-    Função otimizada que usa dados pré-carregados para contar resultados.
+    Conta resultados usando DataFrame unificado (filtragem vetorizada Pandas).
     Funciona para qualquer tipo de análise: screening, confirmatory, confirmatoryTHC.
+    purpose_type: str ou list de str (suporta múltiplas finalidades)
+    subtype_filter: str ou list de str (suporta múltiplas subfinalidades)
     """
-    cache_key = generate_cache_key(f"count_{analysis_type}", laboratory_id, month, purpose_type)
+    cache_key = generate_cache_key(f"count_{analysis_type}", laboratory_id, month, purpose_type, subtype_filter)
     cached = get_cached_data(f"count_{analysis_type}", cache_key)
     if cached is not None:
         return cached
 
     try:
-        # Usar dados pré-carregados com período selecionado
         start_date, end_date = get_selected_period()
-        lots_dict = get_all_lots(start_date, end_date)
-        results_dict = get_all_results(start_date, end_date)
+        df = build_unified_dataframe(start_date, end_date)
 
-        # Filtrar amostras se necessário
-        allowed_chain_ids, allowed_sample_codes = get_filtered_samples(laboratory_id, purpose_type)
+        if len(df) == 0:
+            return {"positivo": 0, "negativo": 0}
 
-        positivo = 0
-        negativo = 0
+        # Filtragem vetorizada - muito mais rapido que loops Python
+        mask = pd.Series(True, index=df.index)
 
-        for lot_code, lot_data in lots_dict.items():
-            # Filtrar por tipo de análise
-            if lot_data["analysisType"] != analysis_type:
-                continue
+        if analysis_type != "all":
+            mask &= df["analysisType"] == analysis_type
+        if month:
+            mask &= df["month"] == month
+        if laboratory_id:
+            mask &= df["lab_id"] == laboratory_id
+        if purpose_type:
+            purposes = purpose_type if isinstance(purpose_type, list) else [purpose_type]
+            mask &= df["purpose_type"].isin(purposes)
+        if subtype_filter:
+            subtypes = subtype_filter if isinstance(subtype_filter, list) else [subtype_filter]
+            mask &= df["subtype"].isin(subtypes)
 
-            # Filtrar por mês
-            if month and lot_data.get("month") != month:
-                continue
-
-            # Filtrar por laboratório/finalidade
-            if allowed_chain_ids is not None:
-                lot_samples = lot_data.get("_samples", set())
-                if not lot_samples.intersection(allowed_chain_ids):
-                    continue
-
-            # Contar resultados deste lote
-            lot_results = results_dict.get(lot_code, [])
-            for sample in lot_results:
-                sample_code = sample.get("_sample")
-
-                # Filtrar por sample_code se necessário
-                if allowed_sample_codes is not None and sample_code not in allowed_sample_codes:
-                    continue
-
-                if sample.get("positive", False):
-                    positivo += 1
-                else:
-                    negativo += 1
+        filtered = df[mask]
+        positivo = int(filtered["positive"].sum())
+        negativo = int((~filtered["positive"]).sum())
 
         result_data = {"positivo": positivo, "negativo": negativo}
         set_cached_data(f"count_{analysis_type}", cache_key, result_data)
@@ -2367,25 +2502,79 @@ def count_results_by_type(analysis_type: str, laboratory_id: str = None, month: 
         return {"positivo": 0, "negativo": 0}
 
 
-def get_triagem_data(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+def get_all_analysis_counts(laboratory_id: str = None, month: int = None, purpose_type=None, subtype_filter=None) -> dict:
+    """
+    Retorna contagens de triagem, confirmatório e confirmatório THC em uma única operação groupby.
+    Muito mais rápido que 3 chamadas separadas a count_results_by_type.
+    Retorna: {"screening": {pos, neg}, "confirmatory": {pos, neg}, "confirmatoryTHC": {pos, neg}}
+    """
+    cache_key = generate_cache_key("all_counts", laboratory_id, month, purpose_type, subtype_filter)
+    cached = get_cached_data("all_analysis_counts", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        start_date, end_date = get_selected_period()
+        df = build_unified_dataframe(start_date, end_date)
+
+        if len(df) == 0:
+            empty = {"positivo": 0, "negativo": 0}
+            return {"screening": empty.copy(), "confirmatory": empty.copy(), "confirmatoryTHC": empty.copy()}
+
+        mask = pd.Series(True, index=df.index)
+        if month:
+            mask &= df["month"] == month
+        if laboratory_id:
+            mask &= df["lab_id"] == laboratory_id
+        if purpose_type:
+            purposes = purpose_type if isinstance(purpose_type, list) else [purpose_type]
+            mask &= df["purpose_type"].isin(purposes)
+        if subtype_filter:
+            subtypes = subtype_filter if isinstance(subtype_filter, list) else [subtype_filter]
+            mask &= df["subtype"].isin(subtypes)
+
+        filtered = df[mask]
+
+        # Groupby único para todos os tipos de análise
+        grouped = filtered.groupby("analysisType")["positive"].agg(["sum", "count"])
+
+        result = {}
+        for atype in ["screening", "confirmatory", "confirmatoryTHC"]:
+            if atype in grouped.index:
+                pos = int(grouped.loc[atype, "sum"])
+                total = int(grouped.loc[atype, "count"])
+                result[atype] = {"positivo": pos, "negativo": total - pos}
+            else:
+                result[atype] = {"positivo": 0, "negativo": 0}
+
+        set_cached_data("all_analysis_counts", cache_key, result)
+        return result
+
+    except Exception as e:
+        st.error(f"Erro ao contar resultados agrupados: {e}")
+        empty = {"positivo": 0, "negativo": 0}
+        return {"screening": empty.copy(), "confirmatory": empty.copy(), "confirmatoryTHC": empty.copy()}
+
+
+def get_triagem_data(laboratory_id: str = None, month: int = None, purpose_type=None, subtype_filter=None) -> dict:
     """
     Busca dados de Triagem (screening) - USA DADOS PRÉ-CARREGADOS.
     """
-    return count_results_by_type("screening", laboratory_id, month, purpose_type)
+    return count_results_by_type("screening", laboratory_id, month, purpose_type, subtype_filter)
 
 
-def get_confirmatorio_data(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+def get_confirmatorio_data(laboratory_id: str = None, month: int = None, purpose_type=None, subtype_filter=None) -> dict:
     """
     Busca dados de Confirmatório (confirmatory) - USA DADOS PRÉ-CARREGADOS.
     """
-    return count_results_by_type("confirmatory", laboratory_id, month, purpose_type)
+    return count_results_by_type("confirmatory", laboratory_id, month, purpose_type, subtype_filter)
 
 
-def get_confirmatorio_thc_data(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+def get_confirmatorio_thc_data(laboratory_id: str = None, month: int = None, purpose_type=None, subtype_filter=None) -> dict:
     """
     Busca dados de Confirmatório THC (confirmatoryTHC) - USA DADOS PRÉ-CARREGADOS.
     """
-    return count_results_by_type("confirmatoryTHC", laboratory_id, month, purpose_type)
+    return count_results_by_type("confirmatoryTHC", laboratory_id, month, purpose_type, subtype_filter)
 
 
 def get_positivity_by_laboratory(start_date: datetime = None, end_date: datetime = None) -> dict:
@@ -2512,9 +2701,10 @@ def get_total_samples(laboratory_id: str = None, month: int = None, purpose_type
         return 0
 
 
-def get_renach_data(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+def get_renach_data(laboratory_id: str = None, month: int = None, purpose_type=None) -> dict:
     """
     Busca dados de RENACH - USA DADOS PRÉ-CARREGADOS (últimos 30 dias).
+    purpose_type: str ou list de str (suporta múltiplas finalidades)
     """
     cache_key = generate_cache_key("renach", laboratory_id, month, purpose_type)
     cached = get_cached_data("renach_data", cache_key)
@@ -2570,8 +2760,8 @@ def get_renach_data(laboratory_id: str = None, month: int = None, purpose_type: 
 
 def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict:
     """
-    Busca contagem de amostras por finalidade - USA DADOS PRÉ-CARREGADOS.
-    Conta apenas amostras que têm resultados processados (consistente com outras métricas).
+    Conta amostras por finalidade usando DataFrame unificado.
+    Conta apenas amostras com resultados de triagem (para nao duplicar).
     """
     cache_key = generate_cache_key("samples_purpose", laboratory_id, month)
     cached = get_cached_data("samples_purpose_data", cache_key)
@@ -2579,73 +2769,37 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
         return cached
 
     try:
-        # Usar dados pré-carregados com período selecionado
         start_date, end_date = get_selected_period()
-        gatherings_data = get_all_gatherings(start_date, end_date)
-        lots_dict = get_all_lots(start_date, end_date)
-        results_dict = get_all_results(start_date, end_date)
+        df = build_unified_dataframe(start_date, end_date)
 
-        chain_to_lab = gatherings_data.get("chain_to_lab", {})
-        chain_to_purpose = gatherings_data.get("chain_to_purpose", {})
+        if len(df) == 0:
+            return {}
 
-        # Calcular período do mês se especificado
-        month_start = None
-        month_end = None
+        # Apenas triagem para nao contar a mesma amostra multiplas vezes
+        mask = df["analysisType"] == "screening"
         if month:
-            year = datetime.now().year
-            month_start = datetime(year, month, 1)
-            if month == 12:
-                month_end = datetime(year, 12, 31, 23, 59, 59)
-            else:
-                month_end = datetime(year, month + 1, 1) - timedelta(seconds=1)
+            mask &= df["month"] == month
+        if laboratory_id:
+            mask &= df["lab_id"] == laboratory_id
 
-        # Mapear tipos de finalidade para nomes legíveis
+        # Chains unicos com resultados de triagem
+        screening_chains = df.loc[mask, ["chain_id", "purpose_type"]].drop_duplicates("chain_id")
+
         purpose_names = {
-            "clt": "CLT",
-            "cltCnh": "CLT + CNH",
-            "civilService": "Concurso Público",
-            "againstProof": "Contra Prova",
-            "periodic": "Periódico",
-            "categoryChange": "Mudança de Categoria",
-            "hiring": "Admissão",
-            "renovation": "Renovação",
-            "resignation": "Demissão"
+            "cnh": "CNH",
+            "clt": "CLT", "cltCnh": "CLT + CNH", "civilService": "Concurso Público",
+            "againstProof": "Contra Prova", "periodic": "Periódico",
+            "categoryChange": "Mudança de Categoria", "hiring": "Admissão",
+            "renovation": "Renovação", "resignation": "Demissão",
+            "other": "Outros"
         }
 
-        # Coletar chain_ids que têm resultados (apenas triagem para não duplicar)
-        chains_com_resultados = set()
-        for lot_code, lot_data in lots_dict.items():
-            # Apenas triagem para não contar a mesma amostra múltiplas vezes
-            if lot_data.get("analysisType") != "screening":
-                continue
+        screening_chains = screening_chains.copy()
+        screening_chains["purpose_name"] = screening_chains["purpose_type"].map(
+            lambda x: purpose_names.get(x, x or 'Não informado')
+        )
 
-            # Filtrar por mês
-            if month and lot_data.get("month") != month:
-                continue
-
-            # Pegar as chains deste lote que têm resultados
-            lot_samples = lot_data.get("_samples", set())
-            lot_results = results_dict.get(lot_code, [])
-
-            if lot_results:
-                chains_com_resultados.update(lot_samples)
-
-        purpose_counts = {}
-
-        for chain_id in chains_com_resultados:
-            purpose_type = chain_to_purpose.get(chain_id, "")
-
-            # Filtrar por laboratório
-            if laboratory_id:
-                lab_id = chain_to_lab.get(chain_id)
-                if lab_id != laboratory_id:
-                    continue
-
-            purpose_name = purpose_names.get(purpose_type, purpose_type or 'Não informado')
-
-            if purpose_name not in purpose_counts:
-                purpose_counts[purpose_name] = 0
-            purpose_counts[purpose_name] += 1
+        purpose_counts = screening_chains["purpose_name"].value_counts().to_dict()
 
         set_cached_data("samples_purpose_data", cache_key, purpose_counts)
         return purpose_counts
@@ -2655,99 +2809,57 @@ def get_samples_by_purpose(laboratory_id: str = None, month: int = None) -> dict
         return {}
 
 
-def get_samples_by_subtype(laboratory_id: str = None, month: int = None, purpose_type: str = None) -> dict:
+def get_samples_by_subtype(laboratory_id: str = None, month: int = None, purpose_type=None, subtype_filter=None) -> dict:
     """
-    Busca contagem de amostras por subfinalidade (purpose.subType) - USA DADOS PRÉ-CARREGADOS.
-    Conta apenas amostras que têm resultados processados (consistente com outras métricas).
+    Conta amostras por subfinalidade usando DataFrame unificado.
+    Conta apenas amostras com resultados de triagem (para nao duplicar).
+    purpose_type: str ou list de str (suporta multiplas finalidades)
+    subtype_filter: str ou list de str (suporta multiplas subfinalidades)
     """
-    cache_key = generate_cache_key("samples_subtype", laboratory_id, month, purpose_type)
+    cache_key = generate_cache_key("samples_subtype", laboratory_id, month, purpose_type, subtype_filter)
     cached = get_cached_data("samples_subtype_data", cache_key)
     if cached is not None:
         return cached
 
     try:
-        # Usar dados pré-carregados com período selecionado
         start_date, end_date = get_selected_period()
-        gatherings_data = get_all_gatherings(start_date, end_date)
-        lots_dict = get_all_lots(start_date, end_date)
-        results_dict = get_all_results(start_date, end_date)
+        df = build_unified_dataframe(start_date, end_date)
 
-        chain_to_lab = gatherings_data.get("chain_to_lab", {})
-        chain_to_purpose = gatherings_data.get("chain_to_purpose", {})
-        chain_to_subtype = gatherings_data.get("chain_to_subtype", {})
+        if len(df) == 0:
+            return {}
 
-        # Calcular período do mês se especificado
-        month_start = None
-        month_end = None
+        # Apenas triagem para nao contar a mesma amostra multiplas vezes
+        mask = df["analysisType"] == "screening"
         if month:
-            year = datetime.now().year
-            month_start = datetime(year, month, 1)
-            if month == 12:
-                month_end = datetime(year, 12, 31, 23, 59, 59)
-            else:
-                month_end = datetime(year, month + 1, 1) - timedelta(seconds=1)
+            mask &= df["month"] == month
+        if laboratory_id:
+            mask &= df["lab_id"] == laboratory_id
+        if purpose_type:
+            purposes = purpose_type if isinstance(purpose_type, list) else [purpose_type]
+            mask &= df["purpose_type"].isin(purposes)
+        if subtype_filter:
+            subtypes = subtype_filter if isinstance(subtype_filter, list) else [subtype_filter]
+            mask &= df["subtype"].isin(subtypes)
 
-        # Mapear tipos de subfinalidade para nomes legíveis
+        # Chains unicos com resultados de triagem
+        screening_chains = df.loc[mask, ["chain_id", "subtype"]].drop_duplicates("chain_id")
+
         subtype_names = {
-            "periodic": "Periódico",
-            "categoryChange": "Mudança de Categoria",
-            "hiring": "Admissão",
-            "renovation": "Renovação",
-            "resignation": "Demissão",
-            "returnToWork": "Retorno ao Trabalho",
-            "return": "Retorno ao Trabalho",
-            "functionChange": "Mudança de Função",
-            "firstLicense": "Primeira Habilitação",
-            "random": "Aleatório",
-            "postAccident": "Pós-Acidente",
-            "reasonableCause": "Causa Razoável",
-            "followUp": "Acompanhamento",
+            "periodic": "Periódico", "categoryChange": "Mudança de Categoria",
+            "hiring": "Admissão", "renovation": "Renovação", "resignation": "Demissão",
+            "returnToWork": "Retorno ao Trabalho", "return": "Retorno ao Trabalho",
+            "functionChange": "Mudança de Função", "firstLicense": "Primeira Habilitação",
+            "random": "Aleatório", "postAccident": "Pós-Acidente",
+            "reasonableCause": "Causa Razoável", "followUp": "Acompanhamento",
             "preEmployment": "Pré-Admissão"
         }
 
-        # Coletar chain_ids que têm resultados (apenas triagem para não duplicar)
-        chains_com_resultados = set()
-        for lot_code, lot_data in lots_dict.items():
-            # Apenas triagem para não contar a mesma amostra múltiplas vezes
-            if lot_data.get("analysisType") != "screening":
-                continue
+        screening_chains = screening_chains.copy()
+        screening_chains["subtype_name"] = screening_chains["subtype"].map(
+            lambda x: subtype_names.get(x, x or 'Não informado')
+        )
 
-            # Filtrar por mês
-            if month and lot_data.get("month") != month:
-                continue
-
-            # Pegar as chains deste lote que têm resultados
-            lot_samples = lot_data.get("_samples", set())
-            lot_results = results_dict.get(lot_code, [])
-
-            if lot_results:
-                chains_com_resultados.update(lot_samples)
-
-        subtype_counts = {}
-
-        for chain_id in chains_com_resultados:
-            # Verificar se tem subtype
-            subtype = chain_to_subtype.get(chain_id)
-            if not subtype:
-                subtype = ""
-
-            # Filtrar por laboratório
-            if laboratory_id:
-                lab_id = chain_to_lab.get(chain_id)
-                if lab_id != laboratory_id:
-                    continue
-
-            # Filtrar por finalidade (purpose.type)
-            if purpose_type:
-                chain_purpose = chain_to_purpose.get(chain_id)
-                if chain_purpose != purpose_type:
-                    continue
-
-            subtype_name = subtype_names.get(subtype, subtype or 'Não informado')
-
-            if subtype_name not in subtype_counts:
-                subtype_counts[subtype_name] = 0
-            subtype_counts[subtype_name] += 1
+        subtype_counts = screening_chains["subtype_name"].value_counts().to_dict()
 
         set_cached_data("samples_subtype_data", cache_key, subtype_counts)
         return subtype_counts
@@ -2759,49 +2871,47 @@ def get_samples_by_subtype(laboratory_id: str = None, month: int = None, purpose
 
 def render_visao_geral():
     st.title("🏠 Visão Geral")
+    _render_visao_geral_content()
 
+
+@st.fragment
+def _render_visao_geral_content():
     # Filtros
     st.markdown("### 🔍 Filtros")
 
     col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
 
-    # Filtro de Finalidade
+    # Filtro de Finalidade - MÚLTIPLA SELEÇÃO
     with col_filtro1:
-        finalidades = {
-            "Todas": None,
+        finalidades_map = {
+            "CNH": "cnh",
             "CLT": "clt",
             "CLT + CNH": "cltCnh",
             "Concurso Público": "civilService",
             "Contra Prova": "againstProof",
+            "Outros": "other",
         }
-        selected_finalidade_name = st.selectbox(
+        selected_finalidades_names = st.multiselect(
             "Finalidade da Amostra",
-            options=list(finalidades.keys()),
-            index=0,
+            options=list(finalidades_map.keys()),
+            default=[],
+            placeholder="Todas as finalidades",
             key="visao_geral_finalidade"
         )
-        selected_purpose = finalidades[selected_finalidade_name]
+        selected_purposes = [finalidades_map[f] for f in selected_finalidades_names] if selected_finalidades_names else None
 
-    # Filtro de Subfinalidade
+    # Filtro de Subfinalidade - MÚLTIPLA SELEÇÃO
     with col_filtro2:
-        # Subfinalidades dependem da finalidade selecionada
+        # Subfinalidades dependem das finalidades selecionadas
         subfinalidades_por_finalidade = {
-            "Todas": {
-                "Todas": None,
+            "CNH": {
                 "Periódico": "periodic",
-                "Admissão": "hiring",
-                "Demissão": "resignation",
-                "Mudança de Categoria": "categoryChange",
                 "Renovação": "renovation",
-                "Retorno ao Trabalho": "returnToWork",
-                "Aleatório": "random",
-                "Pós-Acidente": "postAccident",
-                "Causa Razoável": "reasonableCause",
-                "Acompanhamento": "followUp",
-                "Pré-Admissão": "preEmployment"
+                "Mudança de Categoria": "categoryChange",
+                "Primeira Habilitação": "firstLicense",
+                "Admissão": "hiring",
             },
             "CLT": {
-                "Todas": None,
                 "Periódico": "periodic",
                 "Admissão": "hiring",
                 "Demissão": "resignation",
@@ -2813,7 +2923,6 @@ def render_visao_geral():
                 "Acompanhamento": "followUp"
             },
             "CLT + CNH": {
-                "Todas": None,
                 "Periódico": "periodic",
                 "Admissão": "hiring",
                 "Demissão": "resignation",
@@ -2825,21 +2934,40 @@ def render_visao_geral():
                 "Acompanhamento": "followUp"
             },
             "Concurso Público": {
-                "Todas": None,
                 "Pré-Admissão": "preEmployment"
             },
-            "Contra Prova": {
-                "Todas": None
-            }
+            "Contra Prova": {},
+            "Outros": {}
         }
-        subfinalidades_disponiveis = subfinalidades_por_finalidade.get(selected_finalidade_name, {"Todas": None})
-        selected_subfinalidade_name = st.selectbox(
+        # Calcular subfinalidades disponíveis com base nas finalidades selecionadas
+        if selected_finalidades_names:
+            subfinalidades_disponiveis = {}
+            for fin_name in selected_finalidades_names:
+                subfinalidades_disponiveis.update(subfinalidades_por_finalidade.get(fin_name, {}))
+        else:
+            # Se nenhuma finalidade selecionada, mostrar todas as subfinalidades possíveis
+            subfinalidades_disponiveis = {
+                "Periódico": "periodic",
+                "Admissão": "hiring",
+                "Demissão": "resignation",
+                "Mudança de Categoria": "categoryChange",
+                "Renovação": "renovation",
+                "Primeira Habilitação": "firstLicense",
+                "Retorno ao Trabalho": "returnToWork",
+                "Aleatório": "random",
+                "Pós-Acidente": "postAccident",
+                "Causa Razoável": "reasonableCause",
+                "Acompanhamento": "followUp",
+                "Pré-Admissão": "preEmployment"
+            }
+        selected_subfinalidades_names = st.multiselect(
             "Subfinalidade",
-            options=list(subfinalidades_disponiveis.keys()),
-            index=0,
+            options=sorted(subfinalidades_disponiveis.keys()),
+            default=[],
+            placeholder="Todas as subfinalidades",
             key="visao_geral_subfinalidade"
         )
-        selected_subtype = subfinalidades_disponiveis[selected_subfinalidade_name]
+        selected_subtypes = [subfinalidades_disponiveis[s] for s in selected_subfinalidades_names] if selected_subfinalidades_names else None
 
     # Filtro de Laboratório por CNPJ - MÚLTIPLA SELEÇÃO
     with col_filtro3:
@@ -2885,9 +3013,10 @@ def render_visao_geral():
             lab_id = labs_by_cnpj[cnpj]["id"]
             lab_name = labs_by_cnpj[cnpj]["name"]
 
-            triagem = get_triagem_data(lab_id, None, selected_purpose)
-            confirmatorio = get_confirmatorio_data(lab_id, None, selected_purpose)
-            confirmatorio_thc = get_confirmatorio_thc_data(lab_id, None, selected_purpose)
+            all_counts = get_all_analysis_counts(lab_id, None, selected_purposes, selected_subtypes)
+            triagem = all_counts["screening"]
+            confirmatorio = all_counts["confirmatory"]
+            confirmatorio_thc = all_counts["confirmatoryTHC"]
 
             total_tri = triagem["positivo"] + triagem["negativo"]
             total_conf = confirmatorio["positivo"] + confirmatorio["negativo"]
@@ -3129,7 +3258,7 @@ def render_visao_geral():
         subtype_data_agregado = {}
         for cnpj in selected_cnpjs:
             lab_id = labs_by_cnpj[cnpj]["id"]
-            subtype_data_lab = get_samples_by_subtype(lab_id, None, selected_purpose)
+            subtype_data_lab = get_samples_by_subtype(lab_id, None, selected_purposes, selected_subtypes)
             for sub_name, sub_count in subtype_data_lab.items():
                 if sub_name not in subtype_data_agregado:
                     subtype_data_agregado[sub_name] = 0
@@ -3203,24 +3332,16 @@ def render_visao_geral():
 
     else:
         # ========== MODO NORMAL: UM OU NENHUM CNPJ ==========
-        # Carregar dados com progress bar
         first_lab_id = selected_lab_ids[0] if selected_lab_ids and len(selected_lab_ids) == 1 else None
 
-        tasks = [
-            ("Triagem", get_triagem_data, (first_lab_id, None, selected_purpose)),
-            ("Confirmatório", get_confirmatorio_data, (first_lab_id, None, selected_purpose)),
-            ("Confirmatório THC", get_confirmatorio_thc_data, (first_lab_id, None, selected_purpose)),
-            ("RENACH", get_renach_data, (first_lab_id, None, selected_purpose)),
-            ("Finalidades", get_samples_by_purpose, (first_lab_id, None)),
-            ("Subfinalidades", get_samples_by_subtype, (first_lab_id, None, selected_purpose)),
-        ]
-        data = loading_with_progress(tasks, "Carregando visão geral...")
-        triagem_data = data["Triagem"]
-        confirmatorio_data = data["Confirmatório"]
-        confirmatorio_thc_data = data["Confirmatório THC"]
-        renach_data = data["RENACH"]
-        purpose_data = data["Finalidades"]
-        subtype_data = data["Subfinalidades"]
+        # Chamada única com groupby - 3x mais rápido que 3 chamadas separadas
+        all_counts = get_all_analysis_counts(first_lab_id, None, selected_purposes, selected_subtypes)
+        triagem_data = all_counts["screening"]
+        confirmatorio_data = all_counts["confirmatory"]
+        confirmatorio_thc_data = all_counts["confirmatoryTHC"]
+        renach_data = get_renach_data(first_lab_id, None, selected_purposes)
+        purpose_data = get_samples_by_purpose(first_lab_id, None)
+        subtype_data = get_samples_by_subtype(first_lab_id, None, selected_purposes, selected_subtypes)
 
         # Calcular métricas
         total_triagem = triagem_data["positivo"] + triagem_data["negativo"]
@@ -3501,29 +3622,8 @@ def render_visao_geral():
         st.markdown("### 📌 Amostras por Subfinalidade")
 
         if subtype_data:
-            # Filtrar pelo subtype selecionado se houver
-            if selected_subtype:
-                # Mapear de volta para nome legível
-                subtype_names_inv = {
-                    "periodic": "Periódico",
-                    "categoryChange": "Mudança de Categoria",
-                    "hiring": "Admissão",
-                    "renovation": "Renovação",
-                    "resignation": "Demissão",
-                    "returnToWork": "Retorno ao Trabalho",
-                    "random": "Aleatório",
-                    "postAccident": "Pós-Acidente",
-                    "reasonableCause": "Causa Razoável",
-                    "followUp": "Acompanhamento",
-                    "preEmployment": "Pré-Admissão"
-                }
-                selected_subtype_name = subtype_names_inv.get(selected_subtype, selected_subtype)
-                if selected_subtype_name in subtype_data:
-                    subtype_data_filtered = {selected_subtype_name: subtype_data[selected_subtype_name]}
-                else:
-                    subtype_data_filtered = subtype_data
-            else:
-                subtype_data_filtered = subtype_data
+            # Dados já vêm filtrados por selected_subtypes via get_samples_by_subtype
+            subtype_data_filtered = subtype_data
 
             sorted_subtypes = sorted(subtype_data_filtered.items(), key=lambda x: x[1], reverse=True)
             subfinalidades_lista = [s[0] for s in sorted_subtypes]
@@ -3731,7 +3831,8 @@ def render_perfil_demografico():
                         "cltCnh": "CLT + CNH",
                         "admissional": "Admissional",
                         "periodico": "Periódico",
-                        "demissional": "Demissional"
+                        "demissional": "Demissional",
+                        "other": "Outros"
                     }
                     tipo_formatado = tipos_map.get(tipo_exame, tipo_exame) if tipo_exame else "N/A"
 
@@ -3781,7 +3882,8 @@ def render_perfil_demografico():
                     "cltCnh": "CLT + CNH",
                     "admissional": "Admissional",
                     "periodico": "Periódico",
-                    "demissional": "Demissional"
+                    "demissional": "Demissional",
+                    "other": "Outros"
                 }
 
                 subtipo_texto = subtipos_map.get(top_perfil['purposeSubType'], top_perfil['purposeSubType']) if top_perfil['purposeSubType'] else ""
@@ -4018,8 +4120,8 @@ def get_monthly_positivity_data(
         )
 
         monthly_data = {}
-        meses_nomes = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
-                       "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+        meses_nomes = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+                       "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
 
         # Determinar tipos de análise a buscar
         if analysis_type == "all":
@@ -4046,7 +4148,7 @@ def get_monthly_positivity_data(
             if end_date > year_end:
                 end_date = year_end
 
-            mes_label = f"{meses_nomes[month - 1]}/{year}"
+            mes_label = f"{meses_nomes[month - 1]}/{str(year)[-2:]}"
 
             positivo_total = 0
             negativo_total = 0
@@ -4124,6 +4226,143 @@ def get_monthly_positivity_data(
 
     except Exception as e:
         st.error(f"Erro ao buscar dados mensais: {e}")
+        return {}
+
+
+def get_daily_positivity_data(
+    laboratory_ids: list = None,
+    analysis_type: str = "screening",
+    year: int = None,
+    month: int = None
+) -> dict:
+    """
+    Busca dados de positividade dia a dia dentro de um mes.
+    Retorna dict {dia_label: {positivo, negativo, taxa}}
+    """
+    if year is None:
+        year = datetime.now().year
+    if month is None:
+        month = datetime.now().month
+
+    cache_key = generate_cache_key("daily_positivity", laboratory_ids, analysis_type, year, month)
+    cached = get_cached_data("daily_positivity_data", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        lots_collection = get_collection("lots")
+        results_collection = get_collection("results")
+
+        # Periodo do mes
+        month_start = datetime(year, month, 1)
+        if month == 12:
+            month_end = datetime(year, 12, 31, 23, 59, 59)
+        else:
+            month_end = datetime(year, month + 1, 1) - timedelta(seconds=1)
+
+        # Filtrar amostras por laboratorio se necessario
+        allowed_chain_ids = None
+        allowed_sample_codes = None
+        if laboratory_ids:
+            allowed_chain_ids, allowed_sample_codes = get_filtered_samples_advanced(
+                laboratory_ids=laboratory_ids,
+                start_date=month_start, end_date=month_end
+            )
+
+        # Determinar tipos de analise
+        if analysis_type == "all":
+            analysis_types = ["screening", "confirmatory", "confirmatoryTHC"]
+        else:
+            analysis_types = [analysis_type]
+
+        # Buscar todos os lotes do mes
+        lot_query = {
+            "analysisType": {"$in": analysis_types},
+            "createdAt": {"$gte": month_start, "$lte": month_end}
+        }
+        lots = list(lots_collection.find(lot_query, {"code": 1, "_samples": 1, "createdAt": 1}))
+
+        if not lots:
+            set_cached_data("daily_positivity_data", cache_key, {})
+            return {}
+
+        # Filtrar lotes e agrupar por dia
+        lot_codes_by_day = {}
+        for lot in lots:
+            lot_code = lot.get("code")
+            lot_date = lot.get("createdAt")
+            if not lot_code or not lot_date:
+                continue
+
+            if allowed_chain_ids is not None:
+                lot_samples = lot.get("_samples", [])
+                if not any(s in allowed_chain_ids for s in lot_samples):
+                    continue
+
+            day = lot_date.day
+            if day not in lot_codes_by_day:
+                lot_codes_by_day[day] = []
+            lot_codes_by_day[day].append(lot_code)
+
+        # Buscar todos os results de uma vez
+        all_lot_codes = [c for codes in lot_codes_by_day.values() for c in codes]
+        if not all_lot_codes:
+            set_cached_data("daily_positivity_data", cache_key, {})
+            return {}
+
+        # Criar mapa lot_code -> day
+        lot_to_day = {}
+        for day, codes in lot_codes_by_day.items():
+            for c in codes:
+                lot_to_day[c] = day
+
+        # Buscar results em batch
+        results_raw = list(results_collection.find(
+            {"_lot": {"$in": all_lot_codes}},
+            {"_lot": 1, "samples._sample": 1, "samples.positive": 1}
+        ))
+
+        # Contar por dia
+        day_counts = {}
+        for result in results_raw:
+            lot_code = result.get("_lot")
+            day = lot_to_day.get(lot_code)
+            if day is None:
+                continue
+
+            if day not in day_counts:
+                day_counts[day] = {"positivo": 0, "negativo": 0}
+
+            for sample in result.get("samples", []):
+                if allowed_sample_codes is not None:
+                    if sample.get("_sample") not in allowed_sample_codes:
+                        continue
+                if sample.get("positive", False):
+                    day_counts[day]["positivo"] += 1
+                else:
+                    day_counts[day]["negativo"] += 1
+
+        # Montar resultado com todos os dias do mes
+        import calendar
+        days_in_month = calendar.monthrange(year, month)[1]
+
+        daily_data = {}
+        for day in range(1, days_in_month + 1):
+            label = f"{day:02d}/{month:02d}"
+            counts = day_counts.get(day, {"positivo": 0, "negativo": 0})
+            total = counts["positivo"] + counts["negativo"]
+            taxa = (counts["positivo"] / total * 100) if total > 0 else 0.0
+            daily_data[label] = {
+                "positivo": counts["positivo"],
+                "negativo": counts["negativo"],
+                "taxa": taxa
+            }
+
+        set_cached_data("daily_positivity_data", cache_key, daily_data)
+        return daily_data
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados diarios: {e}")
         return {}
 
 
@@ -4676,6 +4915,7 @@ def get_positivity_by_purpose(
 
         # Mapeamento de finalidades
         purpose_names = {
+            "cnh": "CNH",
             "clt": "CLT",
             "cltCnh": "CLT + CNH",
             "civilService": "Concurso Público",
@@ -4684,7 +4924,8 @@ def get_positivity_by_purpose(
             "categoryChange": "Mudança de Categoria",
             "hiring": "Admissão",
             "renovation": "Renovação",
-            "resignation": "Demissão"
+            "resignation": "Demissão",
+            "other": "Outros"
         }
 
         purpose_data = {}
@@ -5996,9 +6237,13 @@ def render_temporal():
     Página 4 - Análise Temporal: linha de taxa + barras empilhadas com comparativo MoM
     """
     st.title("📈 Análise Temporal")
+    _render_temporal_content()
 
+
+@st.fragment
+def _render_temporal_content():
     # Filtros
-    col_f1, col_f2, col_f3 = st.columns(3)
+    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
 
     with col_f1:
         labs_by_cnpj = get_laboratories_by_cnpj()
@@ -6023,26 +6268,48 @@ def render_temporal():
             selected_lab_ids = None
 
     with col_f2:
-        analysis_options = {"Triagem": "screening", "Confirmatório": "confirmatory", "Todos": "all"}
+        analysis_options = {"Triagem": "screening", "Confirmatório": "confirmatory", "Confirmatório THC": "confirmatoryTHC", "Todos": "all"}
         selected_analysis = st.selectbox("Tipo de Análise", options=list(analysis_options.keys()), index=0, key="temp_analysis")
         analysis_type = analysis_options[selected_analysis]
 
     with col_f3:
-        view_options = {"Mensal": "monthly", "Semanal": "weekly"}
+        view_options = {"Mensal": "daily", "Anual": "yearly"}
         selected_view = st.selectbox("Visualização", options=list(view_options.keys()), index=0, key="temp_view")
         view_type = view_options[selected_view]
 
+    with col_f4:
+        current_year = datetime.now().year
+        if view_type == "daily":
+            # Mensal: selecionar mês e ano
+            col_mes, col_ano = st.columns(2)
+            meses_nomes_select = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                                  "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+            with col_mes:
+                selected_month = st.selectbox("Mês", options=list(range(1, 13)),
+                    format_func=lambda x: meses_nomes_select[x - 1],
+                    index=datetime.now().month - 1, key="temp_month")
+            with col_ano:
+                year_options = list(range(current_year, 2019, -1))
+                selected_year = st.selectbox("Ano", options=year_options, index=0, key="temp_year_daily")
+        else:
+            # Anual: selecionar apenas ano
+            year_options = list(range(current_year, 2019, -1))
+            selected_year = st.selectbox("Ano", options=year_options, index=0, key="temp_year")
+
     st.markdown("---")
 
-    if view_type == "monthly":
+    if view_type == "daily":
         temporal_data = loading_single(
-            get_monthly_positivity_data, "Carregando dados temporais...",
-            laboratory_ids=selected_lab_ids, analysis_type=analysis_type
+            get_daily_positivity_data, "Carregando dados diários...",
+            selected_lab_ids, analysis_type, selected_year, selected_month
         )
     else:
+        year_start_date = datetime(selected_year, 1, 1)
+        year_end_date = datetime(selected_year, 12, 31, 23, 59, 59)
         temporal_data = loading_single(
-            get_weekly_data, "Carregando dados temporais...",
-            selected_lab_ids, analysis_type
+            get_monthly_positivity_data, "Carregando dados anuais...",
+            laboratory_ids=selected_lab_ids, analysis_type=analysis_type,
+            start_date_filter=year_start_date, end_date_filter=year_end_date
         )
 
     if not temporal_data:
@@ -6061,8 +6328,30 @@ def render_temporal():
         for periodo, data in temporal_data.items()
     ])
 
-    # Ordenar por período
-    df_temp = df_temp.sort_values("Período").reset_index(drop=True)
+    # Ordenar por período cronologicamente
+    meses_ordem = {
+        "Jan": 1, "Fev": 2, "Mar": 3, "Abr": 4,
+        "Mai": 5, "Jun": 6, "Jul": 7, "Ago": 8,
+        "Set": 9, "Out": 10, "Nov": 11, "Dez": 12
+    }
+
+    def _sort_periodo(p):
+        # Formato diario: "dd/mm" (ex: "01/03")
+        # Formato mensal: "Mês/Ano" (ex: "Jan/26")
+        if "/" in p:
+            parts = p.split("/")
+            # Verificar se eh formato diario (dd/mm)
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                dia = int(parts[0])
+                mes = int(parts[1])
+                return (0, mes, dia)
+            # Formato mensal (Mês/Ano)
+            mes_nome = parts[0]
+            ano = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            return (ano, meses_ordem.get(mes_nome, 0), 0)
+        return (0, 0, 0)
+
+    df_temp = df_temp.sort_values("Período", key=lambda col: col.map(_sort_periodo)).reset_index(drop=True)
 
     # Calcular métricas
     total_geral = df_temp["Total"].sum()
@@ -6143,104 +6432,60 @@ def render_temporal():
 
     st.markdown("---")
 
-    # ========== GRÁFICO DE LINHA - TAXA DE POSITIVIDADE ==========
-    st.subheader("📉 Evolução da Taxa de Positividade")
+    # ========== GRÁFICO DE BARRAS - TAXA DE POSITIVIDADE (%) ==========
+    st.subheader("📊 Taxa de Positividade (%)")
 
-    fig_linha = px.line(
-        df_temp,
-        x="Período",
-        y="Taxa (%)",
-        markers=True,
-        line_shape="spline"
+    # Hover com quantidades detalhadas
+    hover_text = df_temp.apply(
+        lambda row: f"<b>{row['Período']}</b><br>"
+                     f"Taxa: {row['Taxa (%)']:.2f}%<br>"
+                     f"Positivos: {int(row['Positivos']):,}<br>"
+                     f"Total: {int(row['Total']):,}".replace(",", "."),
+        axis=1
     )
 
-    fig_linha.update_traces(
-        line=dict(color="#FF6B6B", width=3),
-        marker=dict(size=10, color="#FF6B6B")
-    )
+    cores = '#FF6B6B'
 
-    # Adicionar linha de tendência
-    if len(df_temp) > 1:
-        z = np.polyfit(range(len(df_temp)), df_temp["Taxa (%)"], 1)
-        p = np.poly1d(z)
-        df_temp["Tendência"] = p(range(len(df_temp)))
+    fig_taxa = go.Figure()
 
-        fig_linha.add_scatter(
-            x=df_temp["Período"],
-            y=df_temp["Tendência"],
-            mode="lines",
-            name="Tendência",
-            line=dict(color="#00CED1", width=2, dash="dash")
-        )
-
-    # Adicionar anotações com valores
-    fig_linha.update_traces(
+    fig_taxa.add_trace(go.Bar(
+        x=df_temp["Período"],
+        y=df_temp["Taxa (%)"],
+        marker_color=cores,
         text=df_temp["Taxa (%)"].apply(lambda x: f"{x:.1f}%"),
-        textposition="top center",
+        textposition='outside',
         textfont=dict(size=10),
-        selector=dict(mode='lines+markers')
-    )
-
-    fig_linha.update_layout(
-        height=400,
-        margin=dict(t=40, b=50, l=50, r=50),
-        xaxis_title="",
-        yaxis_title="Taxa de Positividade (%)",
-        xaxis_tickangle=-45,
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-
-    st.plotly_chart(fig_linha, use_container_width=True, key="chart_temporal_linha")
-
-    st.markdown("---")
-
-    # ========== GRÁFICO DE BARRAS EMPILHADAS - POSITIVOS VS NEGATIVOS ==========
-    st.subheader("📊 Volume de Amostras: Positivos vs Negativos")
-
-    fig_stack = go.Figure()
-
-    # Barras de Negativos
-    fig_stack.add_trace(go.Bar(
-        name='Negativos',
-        x=df_temp["Período"],
-        y=df_temp["Negativos"],
-        marker_color='#00CED1',
-        text=df_temp["Negativos"].apply(lambda x: f"{x:,}".replace(",", ".")),
-        textposition='inside',
-        textfont=dict(size=10, color='white')
+        hovertext=hover_text,
+        hoverinfo='text',
+        showlegend=False
     ))
 
-    # Barras de Positivos
-    fig_stack.add_trace(go.Bar(
-        name='Positivos',
-        x=df_temp["Período"],
-        y=df_temp["Positivos"],
-        marker_color='#FF6B6B',
-        text=df_temp["Positivos"].apply(lambda x: f"{x:,}".replace(",", ".")),
-        textposition='inside',
-        textfont=dict(size=10, color='white')
-    ))
-
-    fig_stack.update_layout(
-        barmode='stack',
+    fig_taxa.update_layout(
         height=400,
         margin=dict(t=30, b=50, l=50, r=50),
         xaxis_title="",
-        yaxis_title="Quantidade de Amostras",
+        yaxis_title="",
         xaxis_tickangle=-45,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        xaxis=dict(type="category", categoryorder="array", categoryarray=df_temp["Período"].tolist()),
+        yaxis=dict(showticklabels=False)
     )
 
-    st.plotly_chart(fig_stack, use_container_width=True, key="chart_temporal_stack")
+    st.plotly_chart(fig_taxa, use_container_width=True, key="chart_temporal_taxa")
+
+    st.markdown("---")
 
 
-def get_weekly_data(laboratory_ids: list = None, analysis_type: str = "screening") -> dict:
+
+def get_weekly_data(laboratory_ids: list = None, analysis_type: str = "screening", start_date_filter: datetime = None, end_date_filter: datetime = None) -> dict:
     """
     Busca dados semanais de positividade.
     """
-    # Usar período selecionado na sidebar
-    selected_start, selected_end = get_selected_period()
+    # Usar período do filtro ou período selecionado na sidebar
+    if start_date_filter and end_date_filter:
+        selected_start = start_date_filter
+        selected_end = end_date_filter
+    else:
+        selected_start, selected_end = get_selected_period()
     cache_key = generate_cache_key("weekly_data", laboratory_ids, analysis_type, selected_start.isoformat(), selected_end.isoformat())
     cached = get_cached_data("weekly_data", cache_key)
     if cached is not None:
@@ -6250,7 +6495,6 @@ def get_weekly_data(laboratory_ids: list = None, analysis_type: str = "screening
         lots_collection = get_collection("lots")
         results_collection = get_collection("results")
 
-        # Usar período selecionado na sidebar
         start_date = selected_start
         end_date = selected_end
 
